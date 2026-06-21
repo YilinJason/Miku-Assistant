@@ -1,0 +1,340 @@
+# =============================================================================
+# Miku 桌面助手 — 主配置文件
+# 路径：config/config.yaml（可通过 CLI --config 指定其他路径）
+# 修改后重启助手生效；部分项（如 auto_tts）可在运行时通过命令行覆盖
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Ollama LLM 配置
+# 控制与本地 Ollama 服务的连接及所用模型
+# -----------------------------------------------------------------------------
+ollama:
+  # Ollama HTTP API 根地址
+  # 有效值：完整 URL，如 http://localhost:11434 或远程地址
+  # 默认：http://localhost:11434
+  base_url: "http://localhost:11434"
+
+  # 对话使用的模型名称（须已在 Ollama 中 pull/create）
+  # 有效值：ollama list 中显示的模型名，如 llama3、Miku_Assistant-emotion:latest
+  # 默认：Miku_Assistant-emotion:latest
+  model: "Miku_Assistant-emotion:latest"
+
+  # 单次 LLM 请求超时时间（秒）
+  # 有效值：正整数
+  # 默认：60
+  timeout: 60
+
+# -----------------------------------------------------------------------------
+# 语音配置
+# 包含 TTS（文字转语音）与 STT（语音转文字）子系统
+# -----------------------------------------------------------------------------
+voice:
+  # ---------------------------------------------------------------------------
+  # 文字转语音（TTS）
+  # 默认 edge-tts 在线合成；可配置 RVC 后处理为自定义角色音色
+  # ---------------------------------------------------------------------------
+  tts:
+    # TTS 引擎标识
+    # 有效值：edge-tts（默认，需网络）| pyttsx3（纯离线应急）
+    # 默认：edge-tts
+    engine: "edge-tts"
+
+    # edge-tts 的 voice 名称（仅 engine=edge-tts 时生效）
+    # 有效值：edge-tts 支持的 Neural 语音名，如 zh-CN-XiaoxiaoNeural
+    # 默认：zh-CN-XiaoxiaoNeural
+    voice: "zh-CN-XiaoxiaoNeural"
+
+    # 合成语言区域（影响 edge-tts 与部分引擎的默认行为）
+    # 有效值：BCP-47 语言标签，如 zh-CN、en-US
+    # 默认：zh-CN
+    language: "zh-CN"
+
+    # 语速（主要供 pyttsx3 应急引擎使用；edge-tts 有独立 rate 逻辑）
+    # 有效值：正整数，数值越大语速越快
+    # 默认：150
+    rate: 150
+
+    # 播放音量
+    # 有效值：0.0（静音）~ 1.0（最大）
+    # 默认：0.8
+    volume: 0.8
+
+    # edge-tts 不可用时是否自动回退到 fallback_engine
+    # 有效值：true | false
+    # 默认：true
+    fallback_enabled: true
+
+    # 主引擎失败时的备用 TTS 引擎
+    # 有效值：pyttsx3
+    # 默认：pyttsx3
+    fallback_engine: "pyttsx3"
+
+    # 长回复分句流水线：边合成边播放，降低首句等待时间
+    # 有效值：true | false
+    # 默认：true
+    pipeline_enabled: true
+
+    # -------------------------------------------------------------------------
+    # RVC（Retrieval-based Voice Conversion）音色转换
+    # edge-tts 生成 WAV 后，可选经 RVC 转为 Nahida 等自定义音色
+    # 首次使用请运行: powershell -ExecutionPolicy Bypass -File scripts/setup_voice_env.ps1
+    # 未配置 model_path 时整个 RVC 子块被忽略
+    # -------------------------------------------------------------------------
+    rvc:
+      # RVC 模型权重文件路径（相对项目根或绝对路径）
+      # 有效值：存在的 .pth 文件路径
+      # 默认：src/voice/Nahida/nahida-2h-500epoch.pth
+      model_path: "src/voice/Nahida/nahida-2h-500epoch.pth"
+
+      # FAISS 特征索引文件路径（可选，提升相似度检索质量）
+      # 有效值：存在的 .index 文件路径；缺失时仅用模型、index_rate 自动置 0
+      # 默认：src/voice/Nahida/added_IVF7975_Flat_nprobe_1_v2.index
+      index_path: "src/voice/Nahida/added_IVF7975_Flat_nprobe_1_v2.index"
+
+      # 推理设备
+      # 有效值：auto | cpu | cuda:0（auto 有 CUDA 时用 cuda:0，否则 cpu）
+      # 默认：auto
+      device: "auto"
+
+      # 是否启用常驻 RVC Worker 进程（模型只加载一次，降低延迟）
+      # 有效值：true | false；Worker 失败时自动回退一次性子进程（rvc_infer.py）
+      # 默认：true
+      worker_enabled: true
+
+      # 音调偏移（半音）
+      # 有效值：整数，通常 -12 ~ 12
+      # 默认：0
+      pitch: 0
+
+      # 检索特征在混合中的占比（需有效 index_path）
+      # 有效值：0.0 ~ 1.0；偏高易出现颗粒感/电流感，日常对话建议 0.5~0.65
+      # 默认：0.55
+      index_rate: 0.55
+
+      # 送入 RVC 前 MP3→WAV 的目标采样率（与 RVC 训练/推理习惯一致，减轻重采样伪影）
+      # 有效值：正整数，常用 40000
+      # 默认：40000
+      input_sample_rate: 40000
+
+      # vc_single：保护清辅音/气声，减轻电音伪影（越高越保守）
+      # 有效值：0.0 ~ 0.5，推荐 0.45~0.55
+      # 默认：0.5
+      protect: 0.5
+
+      # vc_single：源音量包络混合比（1.0 完全用转换后包络；略低更自然）
+      # 有效值：0.0 ~ 1.0
+      # 默认：0.75
+      rms_mix_rate: 0.75
+
+      # vc_single：f0 中值滤波半径
+      # 有效值：非负整数，0 表示关闭
+      # 默认：3
+      filter_radius: 3
+
+      # vc_single：基频提取方法
+      # 有效值：rmvpe | harvest | crepe 等（取决于 rvc-python 支持）
+      # 默认：rmvpe
+      f0_method: "rmvpe"
+
+      # RVC 输出后处理：高通 + 软限幅，减轻底噪/电流感
+      # 有效值：true | false
+      # 默认：true
+      postprocess_enabled: true
+
+      # 后处理高通截止频率（Hz）；0 表示跳过高通
+      # 默认：80
+      postprocess_highpass_hz: 80
+
+      # 后处理峰值归一目标（0~1）
+      # 默认：0.95
+      postprocess_peak: 0.95
+
+      # RVC 专用 Python 解释器路径（覆盖默认 .venv-rvc）
+      # 有效值：null（使用项目根 .venv-rvc）或 python.exe 绝对/相对路径
+      # 默认：null（未设置）
+      # python_path: null
+
+  # ---------------------------------------------------------------------------
+  # 语音转文字（STT）
+  # 语音交互模式下的麦克风识别配置
+  # ---------------------------------------------------------------------------
+  stt:
+    # STT 引擎标识
+    # 有效值：speech_recognition（默认）| whisper
+    # 默认：speech_recognition
+    engine: "speech_recognition"
+
+    # 识别语言
+    # 有效值：BCP-47 语言标签，如 zh-CN
+    # 默认：zh-CN
+    language: "zh-CN"
+
+    # 麦克风能量阈值（speech_recognition 用于判断是否有语音）
+    # 有效值：正整数，环境嘈杂时可适当调高
+    # 默认：4000
+    energy_threshold: 4000
+
+# -----------------------------------------------------------------------------
+# 系统功能配置
+# Windows 系统控制（关机、重启、锁屏等）总开关
+# -----------------------------------------------------------------------------
+system:
+  # 是否启用 Windows 系统控制意图（关闭后相关指令不执行）
+  # 有效值：true | false
+  # 默认：true
+  windows_control_enabled: true
+
+  # 关机/重启/锁屏前是否弹出二次确认
+  # 有效值：true | false（强烈建议保持 true）
+  # 默认：true
+  require_confirmation: true
+
+# -----------------------------------------------------------------------------
+# 安全策略
+# 控制所有可能影响本机的操作；默认保守，需用户显式开启危险权限
+# 注意：注册表写入在代码层永久禁止，无法通过配置开启 registry_write
+# -----------------------------------------------------------------------------
+security:
+  permissions:
+    # 读取 Windows 注册表（如自动检测 Chrome 安装路径）
+    # 有效值：true | false
+    # 默认：false
+    registry_read: false
+
+    # 写入注册表（仅文档占位；代码硬禁止，配置无效）
+    # 有效值：仅 false
+    # 默认：false
+    registry_write: false
+
+    # 电源操作：关机、重启、锁屏（仍受 system.require_confirmation 约束）
+    # 有效值：true | false
+    # 默认：false（代码默认）；本文件示例为 true
+    system_power: true
+
+    # 启动子进程（浏览器、RVC CLI、外部程序等）
+    # 有效值：true | false
+    # 默认：true
+    subprocess: true
+
+    # os.system 类 Shell 调用（高风险，默认关闭）
+    # 有效值：true | false
+    # 默认：false
+    os_shell: false
+
+    # 打开系统默认或指定浏览器
+    # 有效值：true | false
+    # 默认：true
+    browser_launch: true
+
+    # 删除文件（仅限白名单目录：logs、data/tmp、data/test）
+    # 有效值：true | false
+    # 默认：true
+    file_delete: true
+
+    # 修改当前进程环境变量（RVC 子进程、PATH 等）
+    # 有效值：true | false
+    # 默认：true
+    env_modify: true
+
+# -----------------------------------------------------------------------------
+# 搜索配置
+# 网页搜索意图：搜索引擎选择与浏览器行为
+# -----------------------------------------------------------------------------
+search:
+  # Chrome 可执行文件路径；null 表示自动检测或使用系统默认浏览器
+  # 有效值：null 或 chrome.exe 的绝对路径
+  # 默认：null
+  chrome_path: null
+
+  # 默认搜索引擎
+  # 有效值：google | bing | baidu
+  # 默认：google
+  search_engine: "google"
+
+  # 识别到搜索意图后是否自动打开浏览器
+  # 有效值：true | false
+  # 默认：true
+  auto_open: true
+
+# -----------------------------------------------------------------------------
+# 扩展功能配置
+# 预留第三方/角色模型集成（当前未实现完整流程）
+# -----------------------------------------------------------------------------
+extensions:
+  character_model:
+    # 是否启用角色模型扩展
+    # 有效值：true | false
+    # 默认：false
+    enabled: false
+
+    # 扩展类型标识
+    # 有效值：null | unity | other（视具体实现而定）
+    # 默认：null
+    type: null
+
+    # 扩展专属键值配置（结构由 type 决定）
+    # 有效值：YAML 对象，默认空对象
+    # 默认：{}
+    config: {}
+
+# -----------------------------------------------------------------------------
+# 助手行为与运维配置
+# 日志、自动 TTS、定时清理等
+# -----------------------------------------------------------------------------
+assistant:
+  # LLM 回复后是否自动朗读（可被 CLI --auto-tts 覆盖为 true）
+  # 有效值：true | false
+  # 默认：true
+  auto_tts: true
+
+  # 语音唤醒词（可选；具体行为取决于语音会话实现）
+  # 有效值：字符串或 null
+  # 默认：miku
+  wake_word: "miku"
+
+  # 全局日志级别
+  # 有效值：DEBUG | INFO | WARNING | ERROR
+  # 默认：INFO
+  log_level: "INFO"
+
+  logging:
+    # 是否将日志写入 logs/ 目录（便于崩溃后排查）
+    # 有效值：true | false
+    # 默认：true
+    file_enabled: true
+
+    # 主日志文件名（位于 logs/ 下）
+    # 有效值：字符串，如 miku.log
+    # 默认：miku.log
+    file_name: "miku.log"
+
+    # 单个日志文件大小上限（MB），超出后自动轮转
+    # 有效值：正整数
+    # 默认：10
+    max_size_mb: 10
+
+    # 轮转后保留的历史文件数量（miku.log.1 ~ .N）
+    # 有效值：非负整数
+    # 默认：5
+    backup_count: 5
+
+  file_cleanup:
+    # 后台清理任务检查间隔（分钟）
+    # 有效值：正数
+    # 默认：10
+    interval_minutes: 10
+
+    # data/tmp 下临时音频文件最大保留时间（小时）
+    # 有效值：正浮点数
+    # 默认：1.0
+    tmp_max_age_hours: 1.0
+
+    # logs/ 下过期日志最大保留天数
+    # 有效值：正数
+    # 默认：1
+    logs_max_age_days: 1
+
+    # data/test 下测试输出最大保留时间（小时）
+    # 有效值：正数
+    # 默认：72
+    test_max_age_hours: 72

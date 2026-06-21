@@ -1,0 +1,17 @@
+# Miku Assistant - main app (Python 3.12)
+# Install: py -m pip install -r requirements.txt
+# RVC runs in .venv-rvc via scripts/setup_voice_env.ps1
+
+pyyaml>=6.0.1
+requests>=2.31.0
+
+edge-tts>=6.1.0
+librosa>=0.10.0
+soundfile>=0.12.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.14
+
+pygame>=2.5.0

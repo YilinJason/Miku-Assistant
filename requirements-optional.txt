@@ -1,0 +1,2 @@
+# Offline TTS fallback (used when edge-tts fails or engine is set to pyttsx3)
+pyttsx3>=2.90
