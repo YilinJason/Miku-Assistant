@@ -49,6 +49,9 @@ manifests/
 
 # Cursor IDE 本地缓存（规则文件可保留在仓库外）
 .cursor/
+
+# 本地配置与密钥
+.env
 .env.*
 config/config.local.yaml
 
