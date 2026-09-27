@@ -51,6 +51,11 @@ def main() -> None:
         help="运行模式: text / voice / interactive",
     )
     parser.add_argument("--auto-tts", action="store_true", help="自动将 LLM 回复转为语音")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="启用增量显示与分句播报（无需等完整回答即可开始 TTS）",
+    )
     args = parser.parse_args()
 
     assistant = None
@@ -58,6 +63,8 @@ def main() -> None:
         assistant = MikuAssistant(config_path=args.config)
         if args.auto_tts:
             assistant.config.set("assistant.auto_tts", True)
+        if args.stream:
+            assistant.config.set("assistant.stream_reply", True)
 
         print("=" * 50)
         print("Miku 桌面助手已启动")
@@ -80,12 +87,13 @@ def main() -> None:
                 print("✗ Ollama 连接失败，请确保 Ollama 服务正在运行")
                 print("  提示: 运行 'ollama serve' 启动服务")
 
+        stream_reply = bool(assistant.config.get("assistant.stream_reply", True))
         if args.mode == "text":
-            run_text_session(assistant)
+            run_text_session(assistant, stream_reply=stream_reply)
         elif args.mode == "voice":
-            run_voice_session(assistant, standalone=True)
+            run_voice_session(assistant, standalone=True, stream_reply=stream_reply)
         else:
-            run_interactive_session(assistant)
+            run_interactive_session(assistant, stream_reply=stream_reply)
 
     except KeyboardInterrupt:
         print("\n\n正在退出...")

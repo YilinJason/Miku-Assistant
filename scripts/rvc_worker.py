@@ -9,12 +9,22 @@
     - 启动：解析 CLI 参数，加载模型后向 stdout 输出一行 JSON
       ``{"ready": true, "device": "...", "load_ms": ...}`` 或 ``{"ready": false, "error": "..."}``
     - 任务：每行一个 JSON 对象，至少包含 ``input``、``output`` 路径；可选 ``pitch``、``index_rate``
-    - 控制：``{"cmd": "ping"}`` 返回 pong；``{"cmd": "shutdown"}`` 优雅退出
+    - 控制：``{"cmd": "ping"}`` 返回 pong；``{"cmd": "warmup"}`` 执行一次
+      不播放的短音频推理；``{"cmd": "shutdown"}`` 优雅退出
     - 响应：每任务一行 JSON，``ok`` 为 true 时含 ``output``、``infer_ms``、``total_ms``
 
 须在 ``.venv-rvc`` 环境中运行，依赖与 ``rvc_infer.py`` 相同。
 """
 from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -130,6 +140,84 @@ def _convert(vc, req: dict, worker_cfg: dict) -> tuple[bool, str, float]:
     return True, output_path, infer_ms
 
 
+def _warm_up_vc(vc, worker_cfg: dict) -> tuple[bool, str, float]:
+    """用短正弦 WAV 触发一次完整推理，预热 CUDA/特征提取路径且不播放。"""
+    import numpy as np
+    from scipy.io import wavfile
+
+    sample_rate = 16000
+    duration_seconds = 1.0
+    sample_count = int(sample_rate * duration_seconds)
+    timeline = np.arange(sample_count, dtype=np.float32) / sample_rate
+    # 低振幅有声信号比全静音更能稳定走过 F0 与声学特征路径。
+    signal = (0.03 * np.sin(2.0 * np.pi * 220.0 * timeline)).astype(np.float32)
+
+    with tempfile.TemporaryDirectory(prefix="miku-rvc-warmup-") as temp_dir:
+        input_path = os.path.join(temp_dir, "input.wav")
+        output_path = os.path.join(temp_dir, "output.wav")
+        wavfile.write(input_path, sample_rate, signal)
+        return _convert(
+            vc,
+            {
+                "input": input_path,
+                "output": output_path,
+                "pitch": int(worker_cfg.get("pitch", 0)),
+                "index_rate": float(worker_cfg.get("index_rate", 0.55)),
+            },
+            worker_cfg,
+        )
+
+
+def _parent_is_alive(parent_pid: int) -> bool:
+    """无副作用地检查父进程；权限拒绝时保守视为仍存活。"""
+    if parent_pid <= 0:
+        return True
+    if sys.platform == "win32":
+        from ctypes import wintypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        error_access_denied = 5
+        kernel32 = ctypes.windll.kernel32
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_single_object.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(synchronize, False, parent_pid)
+        if not handle:
+            return kernel32.GetLastError() == error_access_denied
+        try:
+            return wait_for_single_object(handle, 0) == wait_timeout
+        finally:
+            close_handle(handle)
+    try:
+        os.kill(parent_pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _start_parent_watchdog(parent_pid: int) -> None:
+    """父进程消失时立即结束 Worker，避免异常退出后继续占用 CPU/GPU。"""
+    if parent_pid <= 0:
+        return
+
+    def _watch() -> None:
+        while _parent_is_alive(parent_pid):
+            time.sleep(0.5)
+        os._exit(3)
+
+    threading.Thread(target=_watch, name="RVCParentWatchdog", daemon=True).start()
+
+
 def main() -> int:
     """Worker 主循环：加载模型后从 stdin 读取 JSON 行任务直至 shutdown。
 
@@ -189,7 +277,15 @@ def main() -> int:
         default="rmvpe",
         help="基频提取方法，如 rmvpe、harvest",
     )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=0,
+        help="宿主进程 PID；宿主异常退出时 Worker 自动终止，0 表示不监视",
+    )
     args = parser.parse_args()
+
+    _start_parent_watchdog(args.parent_pid)
 
     if not os.path.isfile(args.model):
         _emit_json({"ready": False, "error": f"Model not found: {args.model}"})
@@ -241,6 +337,25 @@ def main() -> int:
 
         if req.get("cmd") == "ping":
             _emit_json({"ok": True, "pong": True})
+            continue
+
+        if req.get("cmd") == "warmup":
+            t0 = time.perf_counter()
+            try:
+                with _redirect_stdout_to_stderr():
+                    ok, detail, infer_ms = _warm_up_vc(vc, worker_cfg)
+                total_ms = (time.perf_counter() - t0) * 1000
+                payload = {
+                    "ok": ok,
+                    "warmup": True,
+                    "infer_ms": round(infer_ms, 1),
+                    "total_ms": round(total_ms, 1),
+                }
+                if not ok:
+                    payload["error"] = detail
+                _emit_json(payload)
+            except Exception as exc:
+                _emit_json({"ok": False, "warmup": True, "error": str(exc)})
             continue
 
         t0 = time.perf_counter()

@@ -60,13 +60,15 @@ def is_rvc_runtime_ready(rvc_config: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def _config_key(rvc_config: Dict[str, Any]) -> str:
-    """根据模型、索引、设备与推理参数生成 Worker 单例缓存键。"""
-    device = resolve_rvc_device(rvc_config)
+    """根据配置生成 Worker 缓存键；CUDA 探测只在新 Worker 构造时执行一次。"""
+    requested_device = (
+        str(rvc_config.get("device", "auto")).strip().lower() or "auto"
+    )
     return "|".join(
         [
             str(rvc_config.get("model_path", "")),
             str(rvc_config.get("index_path", "")),
-            device,
+            requested_device,
             str(rvc_config.get("pitch", 0)),
             str(rvc_config.get("index_rate", 0.55)),
             str(rvc_config.get("protect", 0.5)),
@@ -103,9 +105,24 @@ def stop_rvc_worker() -> None:
     """停止全局 RVC Worker 并清空单例引用（TTS 关闭时调用）。"""
     global _worker_client, _worker_config_key
     if _worker_client:
+        # 先推进操作代际，使尚未发送、正在等待互斥锁的旧转换也失效。
+        _worker_client.interrupt_current()
         _worker_client.stop()
     _worker_client = None
     _worker_config_key = None
+
+
+def interrupt_rvc_worker() -> bool:
+    """插话时取消活跃 RVC 工作；Worker 空闲则保留已加载模型供下一轮复用。"""
+    worker = _worker_client
+    if worker is None:
+        return False
+    interrupted = worker.interrupt_current()
+    if interrupted:
+        logger.info("RVC Worker 活跃任务已终止；客户端保留并可按需重启")
+    else:
+        logger.debug("RVC Worker 当前空闲，插话不卸载模型")
+    return interrupted
 
 
 def warm_rvc_worker(rvc_config: Dict[str, Any]) -> bool:
@@ -123,7 +140,16 @@ def warm_rvc_worker(rvc_config: Dict[str, Any]) -> bool:
     worker_enabled = rvc_config.get("worker_enabled", True)
     if not worker_enabled:
         return False
-    return get_rvc_worker(rvc_config).start()
+    worker = get_rvc_worker(rvc_config)
+    if not worker.start():
+        return False
+    if not rvc_config.get("worker_warmup_inference", True):
+        return True
+    warmup_timeout = float(rvc_config.get("worker_warmup_timeout", 45.0))
+    if not worker.warm_up(timeout=warmup_timeout):
+        # 预热只是性能优化；模型已加载时仍允许真实请求继续。
+        logger.warning("RVC Worker 首次推理预热未完成，真实请求仍可继续")
+    return True
 
 
 def run_rvc_infer_subprocess(
@@ -184,7 +210,7 @@ def run_rvc_infer_subprocess(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=float(rvc_config.get("subprocess_timeout", 90.0)),
             encoding="utf-8",
             errors="ignore",
             context="rvc_infer",
@@ -221,8 +247,17 @@ def run_rvc_infer(
     worker_enabled = rvc_config.get("worker_enabled", True)
     if worker_enabled:
         worker = get_rvc_worker(rvc_config)
-        if worker.convert(input_path, output_path):
+        if worker.convert(
+            input_path,
+            output_path,
+            timeout=float(rvc_config.get("worker_infer_timeout", 45.0)),
+        ):
             return True
-        logger.warning("RVC Worker 失败，回退到一次性子进程")
+        if not rvc_config.get("fallback_on_worker_failure", False):
+            logger.error(
+                "RVC Worker 失败；为避免反复冷启动造成资源风暴，本轮回退默认音色"
+            )
+            return False
+        logger.warning("RVC Worker 失败，按配置回退到一次性子进程")
 
     return run_rvc_infer_subprocess(input_path, output_path, rvc_config, safety_policy)

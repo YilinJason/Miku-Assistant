@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from queue import Queue
+from queue import Empty, Queue
 from typing import List, Optional, Set, Tuple
 
 from src.core.paths import create_app_temp_file
@@ -16,7 +16,7 @@ from src.core.safety import SafetyPolicy
 from src.voice.audio.player import AudioPlayer
 from src.voice.audio.temp_files import TempFileManager
 from src.voice.language import detect_edge_voice, sanitize_for_speech, split_for_speech
-from src.voice.rvc.audio_prep import mp3_to_rvc_wav
+from src.voice.rvc.audio_prep import mp3_to_rvc_wav, warm_audio_preprocessing
 from src.voice.rvc.converter import RVCConverter
 from src.voice.timing import StageTimer, log_elapsed
 
@@ -91,6 +91,10 @@ class TTSEngine:
         self._rvc_ready = False
         self._rvc_last_error: Optional[str] = None
         self._speak_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+        self._interrupt_event = threading.Event()
+        self._interrupt_epoch_lock = threading.Lock()
+        self._interrupt_epoch = 0
 
         if self._rvc and self._rvc.enabled:
             from src.voice.rvc.health_check import check_rvc_health
@@ -102,6 +106,14 @@ class TTSEngine:
                 self.logger.error("%s", self._rvc_last_error)
             else:
                 self.logger.info("RVC Nahida 模型与环境检查通过")
+                if self._rvc_config.get("prewarm_audio_processing", False):
+                    try:
+                        with log_elapsed("MP3→WAV 重采样预热"):
+                            warm_audio_preprocessing(
+                                int(self._rvc_config.get("input_sample_rate", 40000))
+                            )
+                    except Exception as exc:
+                        self.logger.warning("音频重采样预热失败，真实请求仍可继续: %s", exc)
                 if self._rvc_config.get("worker_enabled", True):
                     from src.voice.rvc.infer import warm_rvc_worker
 
@@ -173,7 +185,10 @@ class TTSEngine:
             text: 待朗读文本；会先经 ``sanitize_for_speech`` 清理。
             async_mode: 仅 pyttsx3 时有效，是否非阻塞 ``startLoop``。
         """
+        request_epoch = self._interrupt_epoch_snapshot()
         if not text:
+            return
+        if self._shutdown_event.is_set():
             return
         text = sanitize_for_speech(text)
         if not text:
@@ -181,6 +196,14 @@ class TTSEngine:
             return
 
         with self._speak_lock:
+            if self._shutdown_event.is_set():
+                return
+            # 排队中的旧轮若在等待锁时已被 interrupt，不能清除较新的打断信号。
+            epoch_lock = self._ensure_interrupt_epoch_lock()
+            with epoch_lock:
+                if request_epoch != self._interrupt_epoch:
+                    return
+                self._interrupt_event.clear()
             try:
                 if self.engine_type == "pyttsx3":
                     self._speak_pyttsx3(text, async_mode)
@@ -194,7 +217,11 @@ class TTSEngine:
                     self._speak_single(text)
             except Exception as exc:
                 self.logger.error("TTS 朗读失败: %s", exc, exc_info=True)
-                if self.engine_type == "edge-tts" and self.fallback_enabled:
+                if (
+                    not self._interrupted()
+                    and self.engine_type == "edge-tts"
+                    and self.fallback_enabled
+                ):
                     self.logger.warning("尝试使用应急引擎 pyttsx3 朗读")
                     if self._ensure_pyttsx3_fallback():
                         self._speak_pyttsx3(text, async_mode)
@@ -218,6 +245,7 @@ class TTSEngine:
         timer.mark("合成完成")
         if not play_path:
             timer.finish()
+            self._temp_files.remove_many(*temp_paths)
             return
         with log_elapsed("播放"):
             self._player.play(play_path)
@@ -233,34 +261,49 @@ class TTSEngine:
         errors: List[Exception] = []
 
         def _prepare() -> None:
-            for idx, sentence in enumerate(sentences, start=1):
-                label = f"第{idx}/{len(sentences)}句"
-                try:
-                    play_path, temp_paths = self._prepare_playable_audio(sentence, None, label=label)
-                    temp_registry.update(temp_paths)
-                    if play_path:
-                        ready_queue.put(play_path)
-                except Exception as exc:
-                    errors.append(exc)
-                    self.logger.error("分句合成失败 (%s): %s", label, exc, exc_info=True)
-            ready_queue.put(None)
+            try:
+                for idx, sentence in enumerate(sentences, start=1):
+                    if self._interrupted():
+                        break
+                    label = f"第{idx}/{len(sentences)}句"
+                    try:
+                        play_path, temp_paths = self._prepare_playable_audio(sentence, None, label=label)
+                        temp_registry.update(temp_paths)
+                        if play_path and not self._interrupted():
+                            ready_queue.put(play_path)
+                    except Exception as exc:
+                        errors.append(exc)
+                        self.logger.error("分句合成失败 (%s): %s", label, exc, exc_info=True)
+            finally:
+                ready_queue.put(None)
 
         prep_thread = threading.Thread(target=_prepare, daemon=True)
         prep_thread.start()
 
         played = 0
         while True:
-            play_path = ready_queue.get()
+            try:
+                play_path = ready_queue.get(timeout=0.1)
+            except Empty:
+                if self._interrupted():
+                    break
+                continue
             if play_path is None:
+                break
+            if self._interrupted():
                 break
             with log_elapsed(f"播放第{played + 1}段"):
                 self._player.play(play_path)
             played += 1
             timer.mark(f"第{played}段播放完")
 
-        prep_thread.join(timeout=600)
+        prep_thread.join(timeout=2.0 if self._interrupted() else 600.0)
+        if prep_thread.is_alive():
+            self.logger.warning("TTS 合成线程在插话后仍未退出，将由后台完成并交给临时文件清理器回收")
         timer.finish()
-        self._temp_files.remove_many(*temp_registry)
+        # 合成线程仍可能正在写入/使用登记文件；此时交给周期清理，避免并发删除。
+        if not prep_thread.is_alive():
+            self._temp_files.remove_many(*temp_registry)
 
         if errors and played == 0:
             raise errors[0]
@@ -280,9 +323,14 @@ class TTSEngine:
         temp_paths: Set[str] = set()
         prefix = f"{label} " if label else ""
 
+        if self._interrupted():
+            return None, temp_paths
+
         with log_elapsed(f"{prefix}edge-tts 生成"):
             mp3_path = asyncio.run(self._edge_tts_to_mp3(text))
         temp_paths.add(mp3_path)
+        if self._interrupted():
+            return None, temp_paths
         if timer:
             timer.mark(f"{prefix}edge-tts")
 
@@ -292,6 +340,8 @@ class TTSEngine:
             temp_paths.add(wav_path)
         if timer:
             timer.mark(f"{prefix}转WAV")
+        if self._interrupted():
+            return None, temp_paths
 
         play_path = mp3_path
         if self._rvc and self._rvc.enabled:
@@ -312,7 +362,57 @@ class TTSEngine:
             if timer:
                 timer.mark(f"{prefix}RVC")
 
+        if self._interrupted():
+            return None, temp_paths
+
         return play_path, temp_paths
+
+    def _interrupted(self) -> bool:
+        shutdown = getattr(self, "_shutdown_event", None)
+        interrupted = getattr(self, "_interrupt_event", None)
+        return bool(
+            (shutdown is not None and shutdown.is_set())
+            or (interrupted is not None and interrupted.is_set())
+        )
+
+    def _ensure_interrupt_epoch_lock(self) -> threading.Lock:
+        """兼容少量用 ``object.__new__`` 构造的旧测试替身。"""
+        lock = getattr(self, "_interrupt_epoch_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._interrupt_epoch_lock = lock
+            self._interrupt_epoch = int(getattr(self, "_interrupt_epoch", 0))
+        return lock
+
+    def _interrupt_epoch_snapshot(self) -> int:
+        lock = self._ensure_interrupt_epoch_lock()
+        with lock:
+            return int(getattr(self, "_interrupt_epoch", 0))
+
+    def _signal_interrupt(self) -> None:
+        interrupt_event = getattr(self, "_interrupt_event", None)
+        if interrupt_event is None:
+            interrupt_event = threading.Event()
+            self._interrupt_event = interrupt_event
+        lock = self._ensure_interrupt_epoch_lock()
+        with lock:
+            self._interrupt_epoch += 1
+            interrupt_event.set()
+
+    def interrupt(self) -> None:
+        """用户插话：停止当前播放/合成，实例仍可服务下一轮。"""
+        self._signal_interrupt()
+        self._player.stop_current()
+        if self._pyttsx3 is not None:
+            try:
+                self._pyttsx3.stop()
+            except Exception:
+                pass
+        # 活跃的跨进程推理必须终止才能及时打断；空闲 Worker 保留模型，
+        # 避免每次插话后的下一轮重新加载。
+        from src.voice.rvc.infer import interrupt_rvc_worker
+
+        interrupt_rvc_worker()
 
     async def _edge_tts_to_mp3(self, text: str) -> str:
         """调用 edge-tts 将文本保存为临时 mp3。Returns: mp3 文件路径。"""
@@ -347,7 +447,10 @@ class TTSEngine:
         return None
 
     def shutdown(self) -> None:
-        """停止 RVC Worker 并释放相关资源（应用退出时调用）。"""
+        """停止新合成、当前 pygame 播放与 RVC Worker；可重复调用。"""
+        self._shutdown_event.set()
+        self._signal_interrupt()
+        self._player.stop()
         from src.voice.rvc.infer import stop_rvc_worker
 
         stop_rvc_worker()

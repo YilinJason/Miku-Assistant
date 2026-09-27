@@ -11,7 +11,9 @@
     python main.py --config path/to.yaml    # 指定配置文件
     python main.py --auto-tts               # 强制开启 LLM 回复自动朗读
 
-也可直接 ``python -m src.cli.app``，效果等价。
+支持的启动入口为仓库根目录的 ``main.py``（委托 ``src.cli.app.main``）。
+``python -m src.cli.app`` 当前仅加载模块、**不会**自动调用 ``main()``
+（``src/cli/app.py`` 无 ``__main__`` 入口）；本阶段不新增模块入口。
 """
 import sys
 from pathlib import Path

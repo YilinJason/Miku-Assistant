@@ -5,6 +5,7 @@
 """
 import logging
 import platform
+import threading
 import time
 from typing import Optional
 
@@ -25,6 +26,7 @@ class AudioPlayer:
         self.volume = volume
         self.safety_policy = safety_policy or SafetyPolicy()
         self.logger = logging.getLogger(__name__)
+        self._stop_event = threading.Event()
         self._backend = self._detect_backend()
 
     def _detect_backend(self) -> str:
@@ -67,6 +69,8 @@ class AudioPlayer:
             raise FileNotFoundError(f"音频文件不存在: {audio_file}")
 
         self.logger.debug("播放音频文件: %s", audio_file)
+        if self._stop_event.is_set():
+            return
 
         if self._backend == "pygame":
             import pygame
@@ -74,6 +78,9 @@ class AudioPlayer:
             pygame.mixer.music.set_volume(self.volume)
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy():
+                if self._stop_event.is_set():
+                    pygame.mixer.music.stop()
+                    break
                 time.sleep(0.1)
             self._release_pygame_music()
         elif self._backend == "playsound":
@@ -95,6 +102,22 @@ class AudioPlayer:
                 )
         else:
             raise RuntimeError("无可用音频播放方式（请安装 pygame 或授权 os_shell）")
+
+    def stop(self) -> None:
+        """关闭播放器并请求当前播放停止；之后不再接受新的播放。"""
+        self._stop_event.set()
+        self.stop_current()
+
+    def stop_current(self) -> None:
+        """只停止当前音频；供用户插话使用，不永久关闭播放器。"""
+        if self._backend == "pygame":
+            try:
+                import pygame
+
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            self._release_pygame_music()
 
     @staticmethod
     def _release_pygame_music() -> None:

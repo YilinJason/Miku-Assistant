@@ -13,8 +13,8 @@ Windows 桌面语音助手：本地 **Ollama** 大模型 + **语音对话** + **
 | **LLM 对话** | 通过 [Ollama](https://ollama.com/) 调用本地模型（默认 `Miku_Assistant-emotion:latest`） |
 | **文字转语音 (TTS)** | edge-tts 在线合成 → MP3 转 WAV → 可选 RVC 音色转换 |
 | **语音转文字 (STT)** | 麦克风输入，基于 SpeechRecognition + PyAudio |
-| **语音模式** | 持续监听 → 识别 → 回复 → 朗读；长回复 **分句流水线**，降低首句等待 |
-| **RVC 加速** | 常驻 **Worker** 只加载一次模型；有 NVIDIA GPU 时 **CUDA** 推理 |
+| **语音模式** | 回复期间持续监听；助手回声、语气词和极短噪声转写会被过滤，有效插话可取消当前生成/播报 |
+| **RVC 加速** | 常驻 **Worker** 只加载一次模型；有 NVIDIA GPU 时 **CUDA** 推理；Worker 故障默认回退普通音色以避免重复冷启动 |
 | **系统控制** | 关机 / 重启 / 锁屏（弹窗二次确认） |
 | **网页搜索** | Google / Bing / Baidu，支持 B 站搜索与打开首页 |
 | **安全策略** | 集中式权限控制，注册表写入永久禁止 |
@@ -111,6 +111,7 @@ py main.py --mode interactive   # 默认：文本 + 可切语音 + 可开关 TTS
 py main.py --mode text          # 纯文本
 py main.py --mode voice         # 纯语音
 py main.py --auto-tts           # 启动时强制开启自动朗读
+py main.py --stream             # 显式启用增量显示（当前配置默认开启）
 ```
 
 ---
@@ -127,13 +128,22 @@ py main.py --auto-tts           # 启动时强制开启自动朗读
 | `开启语音模式` / `voice` | 进入持续语音监听 |
 | `关闭语音模式` / `退出语音` | 退出语音模式 |
 | `tts` | 切换是否自动朗读 LLM 回复 |
+| `stream` | 切换增量显示与分句播报（首句完整后即可开始 TTS） |
 | `quit` / `exit` / `退出` | 退出程序 |
 
 ### 语音模式
 
 进入后对着麦克风说话即可。退出关键词：`退出`、`结束`、`quit`、`exit` 等。
 
+默认启用 `assistant.duplex_listening`：识别后增量显示回复，首句可提前 TTS；回复期间麦克风继续监听。与助手已生成文本相似的回声、重复语气音和极短转写不会创建新轮；说“停”“等等”或提出新的完整问题会取消当前生成/播报并开始新轮。关闭该配置时回到串行兼容模式，等待播报完成后再监听。
+
+当前实现是 **STT 转写后的回声与低信息门控**，不等同于声学回声消除（AEC）或语义 VAD。扬声器外放仍需真机调参，建议优先使用耳机。架构边界见 [`docs/architecture/adr-duplex-listening.md`](docs/architecture/adr-duplex-listening.md)。
+
 预检项：麦克风可用、Ollama 连接正常、模型存在。
+
+默认装配会在后台预载 Ollama 模型，并通过 `ollama.keep_alive` 保持一段时间，减少首轮或长时间空闲后的冷加载。冷启动仍可能较慢；日志中的 `[Ollama计时]` 会分别给出加载、提示词计算、生成和 token/s。`keep_alive` 会持续占用模型显存，可在 `config/config.yaml` 中缩短或设为 `0`。
+
+启用 RVC 时还会在启动阶段执行一次不播放的短推理。插话只终止活跃 RVC 推理，空闲 Worker 会保留，避免下一轮重新加载模型。`voice.tts.rvc.prewarm_audio_processing` 可选预热重采样，因首次 JIT 时间受环境影响较大而默认关闭。
 
 ### 自然语言指令示例
 
@@ -166,7 +176,7 @@ py main.py --auto-tts           # 启动时强制开启自动朗读
        ↓
  MP3→WAV（40000Hz，RVC 友好采样率）
        ↓
- RVC Worker（常驻，失败回退 rvc_infer 子进程）
+ RVC Worker（常驻；失败默认回退普通音色，避免逐句冷启动资源风暴）
        ↓
  后处理（高通 + 软限幅，减轻电流感）
        ↓
@@ -204,6 +214,9 @@ voice:
       model_path: "src/voice/Nahida/nahida-2h-500epoch.pth"
       device: "auto"              # auto | cpu | cuda:0
       worker_enabled: true
+      worker_infer_timeout: 45
+      fallback_on_worker_failure: false  # 防止逐句冷启动造成资源风暴
+      subprocess_timeout: 90
       index_rate: 0.55            # 略低可减少颗粒感/电流感
       protect: 0.5                # 保护清辅音，减轻伪影
       rms_mix_rate: 0.75
@@ -212,6 +225,13 @@ voice:
 
 assistant:
   auto_tts: true
+  stream_reply: true
+  duplex_listening: true       # 回复期间继续监听并允许有效插话
+  duplex_listen_timeout: 0.8
+  duplex_phrase_time_limit: 6.0
+  duplex_echo_grace_seconds: 1.0
+  duplex_min_interrupt_chars: 2
+  duplex_echo_match_ratio: 0.72
   logging:
     file_enabled: true
     file_name: "miku.log"
@@ -292,7 +312,7 @@ Miku_Assistant_LLM/
 | RVC 很慢 | 运行 `upgrade_rvc_cuda.ps1`，`device: auto` |
 | 轻微电流感 | 降低 `index_rate`，提高 `protect`；见上文调参表 |
 | 朗读含星号 | TTS 前已自动过滤 Markdown 符号 |
-| 查看耗时 | 日志搜索 `[TTS计时]` |
+| 查看耗时 | 日志搜索 `[Ollama计时]`、`[TTS计时]`；先区分模型加载、生成、TTS、RVC 与播放 |
 
 ---
 

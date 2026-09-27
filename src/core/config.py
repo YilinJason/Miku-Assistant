@@ -65,7 +65,10 @@ class Config:
             'ollama': {
                 'base_url': 'http://localhost:11434',
                 'model': 'Miku_Assistant-emotion:latest',
-                'timeout': 60
+                'timeout': 60,
+                'keep_alive': '30m',
+                'warmup_on_start': True,
+                'warmup_timeout': 120,
             },
             'voice': {
                 'tts': {
@@ -114,6 +117,14 @@ class Config:
             },
             'assistant': {
                 'auto_tts': True,
+                'stream_reply': True,
+                'duplex_listening': True,
+                'duplex_listen_timeout': 0.8,
+                'duplex_phrase_time_limit': 6.0,
+                'duplex_echo_grace_seconds': 1.0,
+                'duplex_interrupt_wait_timeout': 5.0,
+                'duplex_min_interrupt_chars': 2,
+                'duplex_echo_match_ratio': 0.72,
                 'wake_word': 'miku',
                 'log_level': 'INFO',
                 'logging': {

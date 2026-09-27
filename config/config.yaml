@@ -24,6 +24,16 @@ ollama:
   # 默认：60
   timeout: 60
 
+  # 模型在内存/显存中的保活时长，避免几分钟空闲后再次冷加载
+  # Ollama duration 格式，例如 30m、1h；0 表示请求后立即卸载
+  keep_alive: "30m"
+
+  # 程序启动时用空 chat 请求在后台预载模型；不写入会话历史
+  warmup_on_start: true
+
+  # 后台预热请求超时（秒）；预热失败不会阻止正式对话
+  warmup_timeout: 120
+
 # -----------------------------------------------------------------------------
 # 语音配置
 # 包含 TTS（文字转语音）与 STT（语音转文字）子系统
@@ -97,9 +107,34 @@ voice:
       device: "auto"
 
       # 是否启用常驻 RVC Worker 进程（模型只加载一次，降低延迟）
-      # 有效值：true | false；Worker 失败时自动回退一次性子进程（rvc_infer.py）
+      # 有效值：true | false；Worker 失败后的行为由 fallback_on_worker_failure 控制
       # 默认：true
       worker_enabled: true
+
+      # Worker 单段推理最长等待秒数；超时会终止 Worker 并回退默认音色
+      # 默认：45
+      worker_infer_timeout: 45
+
+      # Worker 模型加载后用一秒合成测试信号完成首次推理预热；不会播放或保留音频
+      # 默认：true（增加一次启动计算，降低第一句 RVC 等待）
+      worker_warmup_inference: true
+
+      # 首次推理预热最长等待秒数；失败只记录警告，真实请求仍可继续
+      # 默认：45
+      worker_warmup_timeout: 45
+
+      # 启动时用内存数组预热 librosa 重采样，减少第一段 MP3→WAV 延迟
+      # 默认：false；首次 JIT 时间受环境影响较大，按需开启
+      prewarm_audio_processing: false
+
+      # Worker 失败后是否再冷启动一次性 RVC 子进程。
+      # 默认关闭，避免长回复逐句重复加载模型造成 CPU/GPU/内存资源风暴。
+      # worker_enabled=false 时仍直接使用一次性子进程。
+      fallback_on_worker_failure: false
+
+      # 显式使用一次性子进程时的最长等待秒数
+      # 默认：90
+      subprocess_timeout: 90
 
       # 音调偏移（半音）
       # 有效值：整数，通常 -12 ~ 12
@@ -160,17 +195,19 @@ voice:
   # ---------------------------------------------------------------------------
   stt:
     # STT 引擎标识
-    # 有效值：speech_recognition（默认）| whisper
+    # 有效值：
+    #   speech_recognition — Google 在线识别（默认，需外网；中文准确率一般）
+    #   whisper — 本地 OpenAI Whisper（需 pip install openai-whisper，首次会下载模型）
     # 默认：speech_recognition
     engine: "speech_recognition"
 
     # 识别语言
-    # 有效值：BCP-47 语言标签，如 zh-CN
+    # 有效值：BCP-47 语言标签，如 zh-CN（Whisper 会取主语言 zh）
     # 默认：zh-CN
     language: "zh-CN"
 
-    # 麦克风能量阈值（speech_recognition 用于判断是否有语音）
-    # 有效值：正整数，环境嘈杂时可适当调高
+    # 麦克风能量阈值（speech_recognition 用于判断是否有语音；校准后可能被覆盖）
+    # 有效值：正整数；环境嘈杂可调高，说话偏轻可调低（如 300–1500）
     # 默认：4000
     energy_threshold: 4000
 
@@ -286,6 +323,46 @@ assistant:
   # 有效值：true | false
   # 默认：true
   auto_tts: true
+
+  # 是否默认走增量显示 + 分句播报（可被 CLI --stream / 交互命令 stream 覆盖）
+  # 有效值：true | false
+  # 默认：true（缩短首段等待）
+  stream_reply: true
+
+  # 语音回复期间是否继续监听；有效用户插话会取消当前生成/播报
+  # 当前为转写级回声过滤，不等同于声学 AEC；建议使用耳机获得最佳效果
+  duplex_listening: true
+
+  # 全双工监听每次等待语音开始的超时（秒）；较短值便于会话及时退出
+  duplex_listen_timeout: 0.8
+
+  # 一次插话最长录音秒数
+  duplex_phrase_time_limit: 6.0
+
+  # 播放结束后继续把相似转写视作回声的宽限时间（秒）
+  duplex_echo_grace_seconds: 1.0
+
+  # 有效插话后等待旧回复任务停止的上限（秒）；超时则暂停会话避免任务重叠
+  duplex_interrupt_wait_timeout: 5.0
+
+  # 回复期间普通插话最少规范化字符数；“停/stop”等控制词不受此限制
+  duplex_min_interrupt_chars: 2
+
+  # 插话与已生成助手文本的最长片段覆盖率达到此值时按回声丢弃
+  duplex_echo_match_ratio: 0.72
+
+  # 增量分句缓冲上限（字符）；无句末标点时强制切分，防止无限缓存
+  stream_sentence_max_buffer: 500
+
+  # 分句播报有界队列容量；满时阻塞等待空位（可取消），不静默丢句
+  stream_speech_queue_size: 8
+
+  # 播报队列轮询间隔（秒）：背压等待与消费者取队列共用
+  stream_speech_poll_interval: 0.05
+
+  # 语音流式轮次：等待本轮播报完成的有界超时（秒）
+  # 超时返回播报超时状态，不谎称播放完成
+  stream_playback_wait_timeout: 120
 
   # 语音唤醒词（可选；具体行为取决于语音会话实现）
   # 有效值：字符串或 null
