@@ -24,6 +24,7 @@ from src.core.router_factory import build_intent_router
 from src.core.safety import SafetyPolicy
 from src.extensions.character_interface import CharacterInterface
 from src.llm.ollama_client import OllamaClient
+from src.memory.runtime import MemoryRuntime, parse_memory_settings
 from src.search.chrome_search import ChromeSearcher
 from src.system.windows_control import WindowsController
 from src.voice.stt import STTEngine
@@ -46,6 +47,7 @@ class AssembledParts:
     file_cleaner: Optional[Any]
     router: IntentRouter
     logger: Optional[Any] = None
+    memory_runtime: Optional[Any] = None
 
 
 class _RollbackRegistry:
@@ -93,28 +95,13 @@ def assemble_default(
     file_cleaner_from_config: Optional[Callable[..., Any]] = None,
     router_builder: Optional[Callable[..., IntentRouter]] = None,
     start_cleaner: bool = True,
+    memory_runtime_factory: Optional[Callable[..., Any]] = None,
 ) -> AssembledParts:
     """
     按配置创建并连接默认运行时组件（含副作用）。
 
-    可通过关键字替换构造器，便于离线验证「配置如何传到组件」，
-    而不启动真实音频设备（测试传入假构造器即可）。
-
-    致命装配异常时，逆序回收已登记的清理器（stop）、角色（close）、TTS（shutdown）；
-    不调用 ``cleanup_now``，不关闭 LLM/STT/系统/搜索等未纳入本层回收清单的组件。
-    原始异常在回滚后原样重新抛出。
-
-    Args:
-        config_path: 配置文件路径；``None`` 时由 ``Config`` 使用默认路径。
-        config_loader: ``(config_path) -> config``；默认 ``Config``。
-        logging_setup: ``(config) -> log_file``；默认 ``setup_app_logging``。
-        dir_preparer: 无参可调用对象；默认 ``ensure_runtime_dirs``。
-        *_cls / file_cleaner_from_config: 可替换的组件工厂。
-        router_builder: 路由装配可调用对象；默认 ``build_intent_router``。
-        start_cleaner: 为 ``True`` 时调用 ``file_cleaner.start_auto_cleanup()``。
-
-    Returns:
-        已连接路由的 ``AssembledParts``（成功时不触发提前回收）。
+    ``memory.enabled=false``（默认）时不创建记忆库、不启动提取线程、不包装 LLM。
+    启用时先校验 memory 配置，再创建 runtime，并在后续组件失败时逆序回滚。
     """
     load_config = config_loader or Config
     setup_logging = logging_setup or setup_app_logging
@@ -124,6 +111,10 @@ def assemble_default(
 
     config = load_config(config_path)
     safety_policy = SafetyPolicy.from_app_config(config)
+
+    # memory 配置在任何设备工厂之前校验；未启用则零开销
+    memory_settings = parse_memory_settings(config)
+    memory_enabled = memory_settings.enabled
 
     log_file = setup_logging(config)
 
@@ -138,15 +129,49 @@ def assemble_default(
     logger.debug("安全策略: %s", safety_policy.summary())
 
     rollback = _RollbackRegistry(logger)
+    memory_runtime = None
 
     try:
+        from src.llm.conversation_history import (
+            DEFAULT_MAX_STORED_TURNS,
+            require_max_stored_turns,
+        )
+
+        # 历史上限在任何设备副作用之前严格校验
+        max_stored_turns = require_max_stored_turns(
+            "ollama.history.max_stored_turns",
+            config.get(
+                "ollama.history.max_stored_turns", DEFAULT_MAX_STORED_TURNS
+            ),
+        )
         llm_client = ollama_client_cls(
             base_url=config.get("ollama.base_url"),
             model=config.get("ollama.model"),
             timeout=config.get("ollama.timeout"),
             keep_alive=config.get("ollama.keep_alive", "30m"),
+            max_stored_turns=max_stored_turns,
         )
         logger.info("LLM 模块初始化成功")
+
+        if memory_enabled:
+            make_runtime = memory_runtime_factory or MemoryRuntime.create_from_settings
+            memory_runtime = make_runtime(memory_settings, logger=logger)
+            rollback.register("memory_runtime.close", memory_runtime.close)
+            llm_client = memory_runtime.wrap_llm(llm_client)
+            memory_runtime.start()
+            logger.info("长期记忆模块已启用并启动 ingestion")
+            if not memory_settings.retention_enabled:
+                logger.warning(
+                    "memory.retention.enabled=false：不会自动 prune；"
+                    "请在 config 中显式开启 retention，或接受库体积只增不减"
+                )
+            else:
+                logger.info(
+                    "memory retention 已启用 max_records=%s interval_h=%s preserve_user_confirmed=%s",
+                    memory_settings.retention_max_records,
+                    memory_settings.retention_maintenance_interval_hours,
+                    memory_settings.retention_preserve_user_confirmed,
+                )
 
         tts_config = config.get("voice.tts", {}) or {}
         tts_engine = tts_engine_cls(
@@ -173,7 +198,7 @@ def assemble_default(
         logger.info("STT 模块初始化成功")
 
         windows_controller = None
-        if config.get("system.windows_control_enabled", True):
+        if config.get("system.windows_control_enabled", False):
             windows_controller = windows_controller_cls(
                 safety_policy=safety_policy,
                 require_confirmation=config.get("system.require_confirmation", True),
@@ -184,7 +209,7 @@ def assemble_default(
         chrome_searcher = chrome_searcher_cls(
             chrome_path=search_config.get("chrome_path"),
             search_engine=search_config.get("search_engine", "google"),
-            auto_open=search_config.get("auto_open", True),
+            auto_open=search_config.get("auto_open", False),
             safety_policy=safety_policy,
         )
         logger.info("搜索模块初始化成功")
@@ -228,10 +253,8 @@ def assemble_default(
             file_cleaner=file_cleaner,
             router=router,
             logger=None,
+            memory_runtime=memory_runtime,
         )
-        # 只在装配完全成功后启动后台请求，避免后续构造失败时遗留一个
-        # 无法由回滚表取消的 HTTP 线程。预热本身是可选性能优化，启动失败
-        # 不应阻止应用进入可用状态。
         if config.get("ollama.warmup_on_start", True):
             start_warmup = getattr(llm_client, "start_warmup", None)
             if callable(start_warmup):

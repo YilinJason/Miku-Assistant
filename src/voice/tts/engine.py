@@ -39,6 +39,7 @@ class TTSEngine:
         fallback_engine: str = "pyttsx3",
         pipeline_enabled: bool = True,
         safety_policy: Optional[SafetyPolicy] = None,
+        temp_file_manager: Optional[TempFileManager] = None,
     ):
         """
         初始化 TTS 引擎。
@@ -48,12 +49,13 @@ class TTSEngine:
             language: 语言代码（如 ``zh-CN``），供 pyttsx3 与 STT 对齐。
             rate: 语速（pyttsx3 使用）。
             volume: 播放音量 0.0–1.0。
-            voice: edge-tts 默认 Neural 语音 ID。
-            rvc_config: RVC 配置；含 ``model_path`` 时启用音色后处理。
-            fallback_enabled: 主引擎失败时是否回退 pyttsx3。
-            fallback_engine: 应急引擎，目前仅支持 ``pyttsx3``。
-            pipeline_enabled: 长文本是否分句流水线合成与播放。
-            safety_policy: 安全策略；播放、临时文件与子进程推理时使用。
+            voice: edge-tts 音色名；``None`` 时用默认中文女声。
+            rvc_config: RVC 配置字典；缺 ``model_path`` 时不启用。
+            fallback_enabled: 主引擎失败时是否尝试备用引擎。
+            fallback_engine: 备用引擎名（通常 ``pyttsx3``）。
+            pipeline_enabled: 是否启用分句流水线播报。
+            safety_policy: 安全策略；影响临时文件删除与播放后端。
+            temp_file_manager: 可选外部临时文件管理器；传入时本引擎不拥有其生命周期。
         """
         if engine in _LEGACY_ENGINES:
             logging.getLogger(__name__).warning(
@@ -82,7 +84,11 @@ class TTSEngine:
 
         self._pyttsx3 = None
         self._player = AudioPlayer(volume=volume, safety_policy=self.safety_policy)
-        self._temp_files = TempFileManager(safety_policy=self.safety_policy)
+        self._owns_temp_files = temp_file_manager is None
+        self._temp_files = temp_file_manager or TempFileManager(
+            safety_policy=self.safety_policy
+        )
+        self._temp_files_shutdown_done = False
         self._rvc = (
             RVCConverter(self._rvc_config, safety_policy=self.safety_policy)
             if self._rvc_config.get("model_path")
@@ -447,13 +453,19 @@ class TTSEngine:
         return None
 
     def shutdown(self) -> None:
-        """停止新合成、当前 pygame 播放与 RVC Worker；可重复调用。"""
+        """停止新合成、当前 pygame 播放与 RVC Worker；回收自有 TempFileManager。可重复调用。"""
         self._shutdown_event.set()
         self._signal_interrupt()
         self._player.stop()
         from src.voice.rvc.infer import stop_rvc_worker
 
         stop_rvc_worker()
+        owns = getattr(self, "_owns_temp_files", True)
+        done = getattr(self, "_temp_files_shutdown_done", False)
+        temp_files = getattr(self, "_temp_files", None)
+        if owns and not done and temp_files is not None:
+            self._temp_files_shutdown_done = True
+            temp_files.shutdown()
 
     def save_to_file(self, text: str, filename: str) -> None:
         """

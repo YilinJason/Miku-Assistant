@@ -134,8 +134,35 @@ class ConversationHistoryUnitTests(unittest.TestCase):
         self.assertEqual(len(b), 2)
         self.assertEqual(b.snapshot()[0]["content"], "b1")
 
+    def test_max_stored_turns_trims_complete_pairs_only(self) -> None:
+        hist = ConversationHistory(max_stored_turns=3)
+        for i in range(5):
+            hist.commit_turn(f"u{i}", f"a{i}")
+        self.assertEqual(hist.turn_count, 3)
+        self.assertEqual(len(hist), 6)
+        snap = hist.snapshot()
+        self.assertEqual(snap[0]["content"], "u2")
+        self.assertEqual(snap[-1]["content"], "a4")
+        # 无半轮
+        self.assertEqual(len(snap) % 2, 0)
+        for i in range(0, len(snap), 2):
+            self.assertEqual(snap[i]["role"], "user")
+            self.assertEqual(snap[i + 1]["role"], "assistant")
 
-class OllamaClientHistoryIntegrationTests(unittest.TestCase):
+    def test_ten_thousand_turns_stay_within_cap(self) -> None:
+        cap = 50
+        hist = ConversationHistory(request_window=10, max_stored_turns=cap)
+        for i in range(10_000):
+            hist.commit_turn(f"u{i}", f"a{i}")
+        self.assertEqual(hist.turn_count, cap)
+        self.assertEqual(len(hist), cap * 2)
+        snap = hist.snapshot()
+        self.assertEqual(snap[0]["content"], "u9950")
+        self.assertEqual(snap[-1]["content"], "a9999")
+        built = hist.build_messages("now")
+        self.assertEqual(len(built), 11)
+        self.assertEqual(built[0]["content"], "u9995")
+        self.assertEqual(built[-1], {"role": "user", "content": "now"})
     """generate 路径：fake HTTP，验证窗口、提交规则、流式聚合分支。"""
 
     def _client(self, **kwargs: Any) -> OllamaClient:

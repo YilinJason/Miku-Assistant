@@ -94,11 +94,13 @@ class MikuAssistant:
         router: Optional[IntentRouter] = None,
         log_file: Any = None,
         logger: Optional[logging.Logger] = None,
+        memory_runtime: Any = None,
     ) -> "MikuAssistant":
         """
         显式注入依赖构造（无配置文件加载、无日志落盘、无目录创建、无引擎/清理器自动启动）。
 
         缺失的可选组件保持 ``None``，不会回退创建真实 ``TTSEngine`` / ``STTEngine`` 等。
+        ``memory_runtime`` 可选注入；注入路径不得自动创建真实数据库、HTTP 或线程。
         若未传入 ``router``，则用已注入的系统/搜索/LLM 依赖调用 ``build_intent_router``。
         若未传入 ``safety_policy``，则 ``SafetyPolicy.from_app_config(config)``（仅读内存配置）。
         """
@@ -122,6 +124,7 @@ class MikuAssistant:
             file_cleaner=file_cleaner,
             router=intent_router,
             logger=logger,
+            memory_runtime=memory_runtime,
         )
         return cls(_parts=parts)
 
@@ -138,12 +141,15 @@ class MikuAssistant:
         self.character_interface = parts.character_interface
         self.file_cleaner = parts.file_cleaner
         self.router = parts.router
+        self.memory_runtime = getattr(parts, "memory_runtime", None)
         if parts.logger is not None:
             self.logger = parts.logger
         else:
             self.logger = logging.getLogger(__name__)
         # 关闭流程幂等：整次 shutdown 只执行一轮步骤，失败步骤不在再次调用时重试
+        # memory 未完成关闭时允许后续 shutdown 仅重试 memory close
         self._shutdown_flow_done = False
+        self._non_memory_shutdown_done = False
         self._speech_player = None
         self._shutting_down = False
         self._turn_seq = 0
@@ -941,9 +947,9 @@ class MikuAssistant:
         """
         优雅关闭（容错、顺序幂等）。
 
-        顺序：TTS ``shutdown`` → 清理器 ``stop_auto_cleanup`` → ``cleanup_now`` → 角色 ``close``。
-        某步普通异常会记录后继续后续步骤；若 ``stop_auto_cleanup`` 失败则跳过同清理器的
-        ``cleanup_now``，仍尝试关闭角色。整次流程只执行一轮，再次调用不重复、不重试。
+        顺序：memory runtime → TTS ``shutdown`` → 清理器 → 角色 ``close``。
+        某步普通异常会记录后继续后续步骤。memory 关闭超时/失败时保留重试路径：
+        后续 ``shutdown()`` **只重试尚未完成的 memory close**，不重复关闭已回收资源。
 
         成功时记录「助手已关闭」；任一步失败时记录「关闭流程已结束但部分资源释放失败」，
         不以无条件成功日志掩盖失败。不关闭调用方管理的组件。
@@ -975,6 +981,39 @@ class MikuAssistant:
                     exc_info=True,
                 )
                 return False
+
+        def _close_memory() -> bool:
+            if self.memory_runtime is None:
+                return True
+            runtime = self.memory_runtime
+            if getattr(runtime, "is_closed", False):
+                return True
+
+            def _do_close() -> None:
+                status = runtime.close()
+                if status.worker_alive or status.timed_out or not status.drained:
+                    raise RuntimeError(
+                        "memory close incomplete "
+                        f"worker_alive={status.worker_alive} pending={status.pending} "
+                        f"timed_out={status.timed_out} drained={status.drained}"
+                    )
+
+            return _run_step("memory_runtime", "close", _do_close)
+
+        # 重试路径：仅补完 memory
+        if self._non_memory_shutdown_done:
+            memory_ok = _close_memory()
+            if memory_ok:
+                self._shutdown_flow_done = True
+                self.logger.info("助手 memory 关闭重试已完成")
+            else:
+                self.logger.error(
+                    "助手 memory 关闭仍未完成（将允许再次 shutdown 重试）: %s",
+                    "; ".join(failures) if failures else "incomplete",
+                )
+            return
+
+        memory_ok = _close_memory()
 
         if self.tts_engine:
             _run_step("tts_engine", "shutdown", self.tts_engine.shutdown)
@@ -1008,7 +1047,9 @@ class MikuAssistant:
         if self.character_interface:
             _run_step("character_interface", "close", self.character_interface.close)
 
-        self._shutdown_flow_done = True
+        self._non_memory_shutdown_done = True
+        if memory_ok:
+            self._shutdown_flow_done = True
 
         if failures:
             self.logger.error(
@@ -1016,5 +1057,9 @@ class MikuAssistant:
                 len(failures),
                 "; ".join(failures),
             )
-        else:
+        elif memory_ok:
             self.logger.info("助手已关闭")
+        else:
+            self.logger.error(
+                "助手非 memory 资源已回收，但 memory 关闭未完成（可再次 shutdown 重试）"
+            )

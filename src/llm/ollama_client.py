@@ -5,6 +5,9 @@ Ollama 客户端模块。
 会话历史由 ``ConversationHistory`` 管理；本类负责请求协议与连通性探测。
 结构化整段结果见 ``generate_result``；``generate`` 为兼容字符串转换层。
 增量接口见 ``generate_stream``；语音与文本会话可通过助手的流式编排入口使用。
+
+``/api/chat`` 的动态 system 必须作为 ``messages`` 首条 ``role=system`` 发送；
+不得使用 ``/api/generate`` 的顶层 ``system`` 字段（会被 Chat API 静默忽略）。
 """
 from __future__ import annotations
 
@@ -16,7 +19,11 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from src.llm.conversation_history import ConversationHistory
+from src.llm.conversation_history import (
+    DEFAULT_MAX_STORED_TURNS,
+    ConversationHistory,
+    require_max_stored_turns,
+)
 from src.llm.generate_result import GenerateResult, GenerateStatus
 from src.llm.stream_events import StreamEvent
 
@@ -27,6 +34,7 @@ class OllamaClient:
 
     封装 chat 生成、连接/模型可用性探测；多轮上下文委托给
     ``ConversationHistory``（请求侧附带最近至多 10 条历史消息 + 当前用户输入）。
+    非空 ``system`` 仅作为当前请求 ``messages[0]``，不写入短期历史。
     """
 
     def __init__(
@@ -36,6 +44,7 @@ class OllamaClient:
         timeout: int = 60,
         history: Optional[ConversationHistory] = None,
         keep_alive: Any = None,
+        max_stored_turns: Optional[int] = None,
     ):
         """
         初始化 Ollama 客户端。
@@ -44,16 +53,28 @@ class OllamaClient:
             base_url: Ollama 服务根 URL（不含尾部斜杠会自动去除）。
             model: 默认使用的模型名称（可含 ``:tag``）。
             timeout: HTTP 请求超时时间（秒）。
-            history: 可选会话历史；默认新建独立实例。
+            history: 可选会话历史；默认新建独立实例。显式注入时不改写该对象。
             keep_alive: 可选 Ollama 模型驻留时长，例如 ``"30m"``；``None``
                 保持服务端默认值。
+            max_stored_turns: 仅在未注入 ``history`` 时生效；默认
+                ``DEFAULT_MAX_STORED_TURNS``。
         """
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.keep_alive = keep_alive
         self.logger = logging.getLogger(__name__)
-        self._history = history if history is not None else ConversationHistory()
+        if history is not None:
+            self._history = history
+        else:
+            turns = (
+                DEFAULT_MAX_STORED_TURNS
+                if max_stored_turns is None
+                else require_max_stored_turns(
+                    "max_stored_turns", max_stored_turns
+                )
+            )
+            self._history = ConversationHistory(max_stored_turns=turns)
         self._warmup_lock = threading.Lock()
         self._warmup_done = threading.Event()
         self._warmup_thread: Optional[threading.Thread] = None
@@ -65,6 +86,22 @@ class OllamaClient:
         if self.keep_alive is not None:
             payload["keep_alive"] = self.keep_alive
         return payload
+
+    def _build_chat_messages(
+        self, prompt: str, system: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """
+        构造 ``/api/chat`` 的 ``messages``：可选 system → 历史窗口 → 当前 user。
+
+        - 非空 ``system`` 插入为 ``messages[0]``（``role=system``）。
+        - ``None`` 或空字符串不插入 system，保持历史 + 当前 user。
+        - 返回独立列表/字典副本；不修改 ``ConversationHistory`` 内部记录。
+        流式与非流式路径必须共用本边界，避免协议漂移。
+        """
+        messages = self._history.build_messages(prompt)
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
+        return messages
 
     def warm_up(self, *, timeout: Optional[float] = None) -> bool:
         """发送空 chat 请求预载模型；不读取或修改会话历史。"""
@@ -187,16 +224,13 @@ class OllamaClient:
         """
         url = f"{self.base_url}/api/chat"
         self._wait_for_warmup()
-        messages = self._history.build_messages(prompt)
+        messages = self._build_chat_messages(prompt, system=system)
 
         payload = self._apply_runtime_options({
             "model": self.model,
             "messages": messages,
             "stream": stream,
         })
-
-        if system:
-            payload["system"] = system
 
         try:
             response = requests.post(url, json=payload, timeout=self.timeout)
@@ -273,14 +307,12 @@ class OllamaClient:
     ) -> Iterator[StreamEvent]:
         url = f"{self.base_url}/api/chat"
         self._wait_for_warmup()
-        messages = self._history.build_messages(prompt)
+        messages = self._build_chat_messages(prompt, system=system)
         payload: Dict[str, Any] = self._apply_runtime_options({
             "model": self.model,
             "messages": messages,
             "stream": True,
         })
-        if system:
-            payload["system"] = system
 
         response: Optional[requests.Response] = None
         terminal_emitted = False

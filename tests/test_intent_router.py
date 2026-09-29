@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from typing import List, Optional
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,7 @@ from src.core.handlers import (
     SearchIntentHandler,
     SystemIntentHandler,
 )
+from src.core.config import Config
 from src.core.router import IntentRouter
 from src.core.router_factory import build_intent_router
 from src.core.safety import Operation, SafetyPolicy
@@ -26,6 +29,33 @@ _POWER_PHRASES = (
     ("重启", "restart"),
     ("锁屏", "lock"),
 )
+
+
+class SecurityDefaultTests(unittest.TestCase):
+    """缺省配置必须保持最小权限；显式开启另由各能力契约测试覆盖。"""
+
+    def test_policy_denies_device_affecting_defaults(self) -> None:
+        with _CLEAR_MIKU_DRY_RUN:
+            policy = SafetyPolicy()
+        for operation in (
+            Operation.REGISTRY_READ,
+            Operation.REGISTRY_WRITE,
+            Operation.SYSTEM_POWER,
+            Operation.OS_SHELL,
+            Operation.BROWSER_LAUNCH,
+            Operation.ENV_MODIFY,
+        ):
+            with self.subTest(operation=operation):
+                self.assertFalse(policy.is_allowed(operation))
+
+    def test_generated_config_does_not_enable_system_or_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(str(Path(tmp) / "config.yaml"))
+            self.assertFalse(config.get("system.windows_control_enabled"))
+            self.assertFalse(config.get("security.permissions.system_power"))
+            self.assertFalse(config.get("security.permissions.browser_launch"))
+            self.assertFalse(config.get("security.permissions.env_modify"))
+            self.assertFalse(config.get("search.auto_open"))
 
 
 class RecordingHandler(IntentHandler):

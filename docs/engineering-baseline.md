@@ -84,7 +84,7 @@ TTSEngine.speak
 2. RVC 健康检查；通过且 `worker_enabled` 时 **`warm_rvc_worker` 拉起子进程并加载模型**  
 3. 导入/探测 edge-tts 或初始化 pyttsx3  
 
-`MikuAssistant.__init__` 另启动 `FileCleaner.start_auto_cleanup()`（daemon `Timer`）。
+`MikuAssistant.__init__` 另启动 `FileCleaner.start_auto_cleanup()`（daemon `Timer`；启动线程不同步无界扫盘；每轮扫描/删除有上限；仅 `data/tmp`/`logs`/`data/test`）。
 
 ### 1.5 流式输出实际覆盖层
 
@@ -106,7 +106,7 @@ TTSEngine.speak
 1. **入口**：支持的启动方式为仓库根目录 **`py main.py` / `python main.py`**（委托 `src.cli.app.main`）。`python -m src.cli.app` **不会**自动进入 CLI（`app.py` 无 `if __name__ == "__main__"`）；本阶段**不**新增模块入口。参数：`--mode text|voice|interactive`、`--config`、`--auto-tts`。  
 2. **意图优先级**：系统控制 → 搜索 → LLM 兜底。  
 3. **系统控制**：仅关机/重启/锁屏；须 `system_power` +（默认）确认对话框；`MIKU_DRY_RUN` / 无权限 / 显式 `dry_run` 时返回拦截文案，不执行。  
-4. **LLM 上下文**：请求 payload = **至多 10 条历史消息**（`ConversationHistory` 请求窗口，计的是 **message 条数**，不是「轮」）**+ 当前用户输入** 一条。一对 user/assistant 通常算 2 条消息；故约等于最多 5 轮历史对话再加当前句。内存存储仍可能继续增长（见 P3；有界存储另案）。仅 `generate_result` 的 `SUCCESS` 非空回复提交一轮；失败/空回复不写半轮。`generate()` 仍返回字符串：失败为以 `错误:` 开头的兼容文案（**不**用此前缀判断结构化成败）。公开属性 `OllamaClient.conversation_history` 为可修改副本（改副本不影响内部）。默认客户端历史相互隔离；显式注入同一 `ConversationHistory` 时共享。旧 Handler 仍只调 `generate()`，错误播报问题尚未接入结构化结果。
+4. **LLM 上下文**：请求 payload =（可选）**首条 `messages[0]` system** + **至多 10 条历史消息**（`ConversationHistory` 请求窗口，计的是 **message 条数**，不是「轮」）**+ 当前用户输入** 一条。顺序固定为 `system → 历史 → 当前 user`。`/api/chat` **不得**再带顶层 `system`（属 `/api/generate`）；非空动态 system（含记忆增强块）必须作为 system message 发送，否则会被服务端静默忽略。一对 user/assistant 通常算 2 条消息；故约等于最多 5 轮历史对话再加当前句。内存存储默认按完整轮上限裁剪（`max_stored_turns`，默认 500；见 `adr-storage-retention-cleanup.md`）。仅 `generate_result` 的 `SUCCESS` 非空回复提交一轮；失败/空回复不写半轮；system 不进入短期历史。`generate()` 仍返回字符串：失败为以 `错误:` 开头的兼容文案（**不**用此前缀判断结构化成败）。公开属性 `OllamaClient.conversation_history` 为可修改副本（改副本不影响内部）。默认客户端历史相互隔离；显式注入同一 `ConversationHistory` 时共享。旧 Handler 仍只调 `generate()`，错误播报问题尚未接入结构化结果。回归测试须检查最终 HTTP `json`（`tests/test_ollama_chat_system_contract.py`），不能只断言包装器 `system=` 参数。
 5. **TTS**：edge-tts 为主，可 RVC；edge 失败可 pyttsx3；朗读前清理 Markdown 星号等；长文可分句流水线。  
 6. **RVC**：独立 venv；Worker 常驻 + 子进程回退；失败时回退播放 edge-tts 音频。  
 7. **语音模式**：预检不过则不进入；空识别/`WaitTimeout` 继续循环；停止词与「关闭语音模式」可退。  
@@ -154,6 +154,7 @@ TTSEngine.speak
 | `tests/test_assistant_orchestration.py` | **离线** unittest | fake + 可替换装配工厂 | 注入编排 / 默认接线；不启真实设备 |
 | `tests/test_assembly_rollback.py` | **离线** unittest | fake 构造器 | 装配失败回滚 |
 | `tests/test_conversation_history.py` | **离线** unittest | fake HTTP | 会话历史窗口/提交/隔离；不连真实 Ollama |
+| `tests/test_ollama_chat_system_contract.py` | **离线** unittest | mocked `requests.post` | `/api/chat` system→`messages[0]`；断言最终 HTTP JSON；记忆含银杏4729/桂花乌龙 |
 | `tests/test_generate_result.py` | **离线** unittest | fake HTTP | 结构化结果分类与 `generate` 兼容层 |
 | `tests/test_structured_dispatch.py` | **离线** unittest | fake | Handler/路由/助手消费结构化结果 |
 | `tests/test_generate_stream.py` | **离线** unittest | 可控 HTTP 流 | `generate_stream` 增量事件；不连真实 Ollama |
@@ -197,7 +198,7 @@ py -3 -m unittest discover -s tests -v
 | 可选 `requirements-optional.txt` | 仅 pyttsx3；与 fallback 一致 |
 | RVC | 不在主 requirements；由 `scripts/setup_voice_env.ps1` / `upgrade_rvc_cuda.ps1` —— 与 README/VOICE 一致 |
 | `config.yaml` RVC 音质参数 | 与 `vc_params`/`postprocess` 实现一致；**VOICE.md 未同步全量**（P12） |
-| `security.permissions.system_power: true` | 与「代码默认 false」不同，属仓库示例配置偏开放；README 已提示须显式开启 |
+| 系统/浏览器权限默认值 | `windows_control_enabled`、`system_power`、`browser_launch`、`env_modify`、`search.auto_open` 均为 false；需显式开启 |
 | README 流式/流水线表述 | 「分句流水线」属 TTS，易被读成 LLM 流式——建议后续改文案对齐 P1 |
 | `AGENTS.md` + `skills/` | 工作区未跟踪文件；与 GitHub 已推送内容无关，本审计保留不提交 |
 
@@ -245,7 +246,7 @@ py -3 -m unittest discover -s tests -v
 
 | 项 | 说明 |
 |----|------|
-| `src/llm/conversation_history.py` | `ConversationHistory`：存储 + 请求窗口选择；默认窗口 10 条消息 |
+| `src/llm/conversation_history.py` | `ConversationHistory`：存储 + 请求窗口选择；默认窗口 10 条消息；默认 `max_stored_turns=500` 按完整轮裁剪 |
 | `OllamaClient` | 委托历史；`generate(...)` / `clear_history()` 调用方式不变 |
 | 请求窗口 vs 存储 | 窗口只影响 payload；存储本轮不截断（P3 另案） |
 | 提交规则 | 成功非空才 `commit_turn`；失败/空回复不写；流式聚合与非流式共用 |
@@ -253,7 +254,7 @@ py -3 -m unittest discover -s tests -v
 | 隔离 | 默认新建实例相互隔离；显式注入同一 `ConversationHistory` 则共享，`clear_history` 影响共享者 |
 | 测试 | `tests/test_conversation_history.py`（14 项，含解析失败 / 流中非法 JSON / 流中断连） |
 | ADR | `docs/architecture/adr-conversation-history.md` |
-| **未做** | 持久化、长期记忆、有界存储、改 Ollama 协议、端到端流式 |
+| **未做** | 持久化、长期记忆、改 Ollama 协议、端到端流式 |
 
 ### 6.6 第六小步（结构化生成结果）— 已完成（**新接口 + 兼容层 + 边界补齐**）
 
@@ -307,7 +308,7 @@ py -3 -m unittest discover -s tests -v
 | CLI | `--stream`；播报失败短提示不重复全文 |
 | ADR | `adr-stream-playback.md` |
 | 测试 | `test_generate_stream` + `test_stream_playback`（B/C 交错、真实客户端播放失败、CLI stage） |
-| 最近离线结果 | `unittest discover -s tests -q` → **191 tests / OK**（含持续监听、模型/音频预热与 RVC Worker 生命周期故障覆盖） |
+| 最近离线结果 | `unittest discover -s tests -q` → 见 handoff（含资源上限、资格边界、admission gate、诊断遥测） |
 
 ### 6.10 语音会话增量 + 播报完成契约 — 已完成
 
@@ -346,15 +347,57 @@ py -3 -m unittest discover -s tests -v
 | 测试 | `tests/test_voice_input_gate.py` + `test_voice_session` + `test_rvc_worker_lifecycle` |
 | 能力边界 | 当前为 STT 转写后门控，不是声学 AEC/语义 VAD；真实外放环境仍需设备验收 |
 
+### 6.13 长期记忆领域契约 + SQLite 持久层 — 已完成（未接入对话）
+
+| 项 | 说明 |
+|----|------|
+| 边界 | `src/memory/` 独立于 `ConversationHistory`；不改 Ollama/助手/语音行为 |
+| 契约 | `MemoryRecord` / `NewMemory` / `MemorySource` / `MemoryCategory` / `MemoryStore` |
+| SQLite | `SqliteMemoryStore`；`PRAGMA user_version=1`；参数化 SQL；事务；单连接 + RLock |
+| 去重 | 规范化键精确唯一；**展示正文含首尾/内部空白均原样保存**，规范化仅作用于去重键 |
+| 故障 | 校验/缺失/不可用/`MemoryDataCorruptError`/高版本 schema 非破坏拒绝；不吞 KI/SystemExit |
+| ADR | `docs/architecture/adr-long-term-memory-store.md` |
+| 测试 | `tests/test_memory_store.py`（TemporaryDirectory，无设备/模型） |
+| 未做 | 见 6.14；启动时创建用户库仍未做 |
+
+### 6.14 长期记忆应用服务、词法检索与异步提取契约 — 已完成（未接入对话）
+
+| 项 | 说明 |
+|----|------|
+| 边界 | 应用层仍在 `src/memory/`；**未**装配到 `MikuAssistant` / Handler / CLI / VoiceSession / `assemble_default` |
+| 契约 | `MemoryTurnEvent` / `ExtractedMemory` / `MemoryExtractor` / `MemoryRecallResult` / `MemoryContext` |
+| 列表 | `list_memories` 支持 `newest_first`；有界 has-more 探测上限 `500+1` |
+| 检索 | `LexicalMemoryRecall`：最近有限候选 + 中英词法打分（非语义）；`truncated_candidates` 仅在确认仍有未扫描项时为 True |
+| 提取 | `MemoryIngestionService`：有界队列、非阻塞 `submit`、单消费者、失败开放；写库统一 `MODEL_INFERRED`；**owned store 在 worker 存活时不关**；**用户原文唯一事实来源**（见 provenance） |
+| 上下文 | `format_memory_context` / `MemoryQueryService`：条数+字符预算、JSON Lines、不可信数据声明；**不注入提示词** |
+| ADR | `docs/architecture/adr-memory-service.md` |
+| 测试 | `tests/test_memory_service.py` + 既有 store 测试（TemporaryDirectory / fake，无设备/模型） |
+| 未做 | 见 6.15 |
+
+### 6.15 长期记忆产品接线 + 无历史 Ollama 提取适配器 — 真实合成样本已通过
+
+| 项 | 说明 |
+|----|------|
+| 默认 | `memory.enabled: false`；未启用零开销、不包装 LLM |
+| 装饰器 | `MemoryAwareLLMClient`：有界 recall 只扩 `system`；成功完整轮非阻塞 submit；前台 admission 标记；提交前释放本轮 lease |
+| 提取器 | 无历史 `/api/chat`；**本地 `UserFactUnit`（segment 先验收 + 并列 all-or-nothing）→ 模型只选 `unit_id` → 本地 renderer**；Schema **required: unit_id**；无候选不发 HTTP；单项非法选择不拖垮整批；资格边界 + 遥测 |
+| 准入 | 小型 `ForegroundAwareAdmissionGate`（前台忙则跳过提取；不可抢占已发 HTTP） |
+| 装配 | `MemoryRuntime` 拥有 store；有界关闭 / `wait_until_idle` |
+| 验收入口 | dry-run 默认 keep_alive=`1m`；wrapper seed+final 双 idle；incomplete close 后有界 reclaim，失败则 `retained_incomplete_close`；报告 schema **v3**。真实 v3 exit 0，单一 8192 runner，无 context 重建 |
+| ADR / 说明 | `adr-memory-product-integration.md`、`memory-real-text-acceptance.md`、`cursor-next-memory-context-stability.md` |
+| 测试 | `test_memory_integration` + `test_memory_diagnostic` + `test_memory_trusted_boundary` + `test_memory_provenance` + `test_id_audit` |
+| 已验证 | 离线契约、资格、遥测、admission、lease、双 idle、inherit num_ctx、有界 reclaim / retained |
+| 未验证 | 长时间 soak；运行中显存峰值曲线；独立小模型；端到端陪伴；不得宣称已证无内存泄漏 |
+
 ### 明确仍未做
 
-- 生产默认路径延迟初始化（构造仍会预热 TTS/RVC 等）  
-- 并发 `shutdown` 与第三方阻塞音频后端的硬打断尚未完整验证；RVC Worker 正常/超时回收已有离线覆盖  
-- 构造器内部泄漏、LLM/STT 等装配失败时的关闭策略  
-- 会话历史有界存储、持久化、长期记忆  
-- 声学 AEC、音频/语义 VAD、连续 PCM provider 与播放文字时间对齐  
-- 仅字符串客户端的失败语义仍弱  
-- DI 框架、pytest 依赖、`python -m src.cli.app` 入口  
+- 生产默认路径延迟初始化（构造仍会预热 TTS/RVC 等）
+- 并发 `shutdown` 与第三方阻塞音频后端的硬打断尚未完整验证；RVC Worker 正常/超时回收已有离线覆盖
+- 构造器内部泄漏、LLM/STT 等装配失败时的关闭策略
+- 会话历史有界存储已落地（Round 1）；长期记忆的**真实提取质量、提示词效果与 GPU 优先级调度**；按模式装配与权限收窄见 Round 2/3
+- 声学 AEC、音频/语义 VAD、连续 PCM provider 与播放文字时间对齐
+- 仅字符串客户端的失败语义仍弱
+- DI 框架、pytest 依赖、`python -m src.cli.app` 入口
 
 ### 回退
 
@@ -371,10 +414,10 @@ py -3 -m unittest discover -s tests -v
 
 ```text
 C:\Users\uitra\AppData\Local\Programs\Python\Python312\python.exe -X utf8 -m unittest discover -s tests -q
-→ Ran 191 tests in 4.726s … OK
+→ Ran 288 tests in 7.711s … OK
 ```
 
-含语音里程碑：播报完成契约、Event 驱动取消、STT 状态映射、provider 注入、持续监听输入门控、有效插话、TTS 中断代际、Ollama 预热/保活、RVC 设备探测去重、首段推理/重采样预热，以及空闲 Worker 插话复用。第二阶段音频性能修改仍仅完成离线契约测试。
+含既有语音/STT/持续监听回归、长期记忆栈，以及资源上限、资格边界、admission gate、诊断短保活与遥测。用户真实 v3 `--execute` exit 0，关闭完整且未再重建 runner；长时间 soak、显存峰值曲线与端到端陪伴未验证。
 
 ### 历史发现仍成立（只读）
 

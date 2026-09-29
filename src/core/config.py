@@ -69,6 +69,9 @@ class Config:
                 'keep_alive': '30m',
                 'warmup_on_start': True,
                 'warmup_timeout': 120,
+                'history': {
+                    'max_stored_turns': 500,
+                },
             },
             'voice': {
                 'tts': {
@@ -88,7 +91,7 @@ class Config:
                 }
             },
             'system': {
-                'windows_control_enabled': True,
+                'windows_control_enabled': False,
                 'require_confirmation': True,
             },
             'security': {
@@ -98,15 +101,15 @@ class Config:
                     'system_power': False,
                     'subprocess': True,
                     'os_shell': False,
-                    'browser_launch': True,
+                    'browser_launch': False,
                     'file_delete': True,
-                    'env_modify': True,
+                    'env_modify': False,
                 },
             },
             'search': {
                 'chrome_path': None,
                 'search_engine': 'google',
-                'auto_open': True
+                'auto_open': False
             },
             'extensions': {
                 'character_model': {
@@ -135,11 +138,45 @@ class Config:
                 },
                 'file_cleanup': {
                     'interval_minutes': 10,
+                    'cleanup_on_start': False,
+                    'max_scan_files': 500,
+                    'max_delete_files': 100,
                     'tmp_max_age_hours': 1.0,
                     'logs_max_age_days': 1,
                     'test_max_age_hours': 72,
                 },
-            }
+            },
+            'memory': {
+                'enabled': False,
+                'db_path': None,
+                'recall': {
+                    'max_entries': 8,
+                    'max_chars': 1200,
+                    'candidate_limit': 200,
+                },
+                'ingestion': {
+                    'queue_capacity': 32,
+                    'max_extractions_per_turn': 16,
+                    'close_drain': True,
+                    'close_timeout': 5.0,
+                },
+                'extractor': {
+                    'base_url': None,
+                    'model': None,
+                    'timeout': None,
+                    'keep_alive': None,
+                    'num_ctx': None,
+                    'num_predict': 512,
+                },
+                'retention': {
+                    'enabled': False,
+                    'max_records': 2000,
+                    'max_age_days': 365.0,
+                    'maintenance_interval_hours': 24.0,
+                    'preserve_user_confirmed': True,
+                    'batch_limit': 64,
+                },
+            },
         }
 
     def get(self, key: str, default: Any = None) -> Any:

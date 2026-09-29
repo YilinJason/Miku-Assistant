@@ -50,9 +50,9 @@ class SafetyPolicy:
         Operation.SYSTEM_POWER: False,
         Operation.SUBPROCESS: True,
         Operation.OS_SHELL: False,
-        Operation.BROWSER_LAUNCH: True,
+        Operation.BROWSER_LAUNCH: False,
         Operation.FILE_DELETE: True,
-        Operation.ENV_MODIFY: True,
+        Operation.ENV_MODIFY: False,
     }
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):

@@ -34,6 +34,11 @@ ollama:
   # 后台预热请求超时（秒）；预热失败不会阻止正式对话
   warmup_timeout: 120
 
+  # 进程内会话历史存储上限（完整 user/assistant 轮）
+  # 与请求窗口（默认最近 10 条消息）分离；拒绝 bool/字符串/非正数
+  history:
+    max_stored_turns: 500
+
 # -----------------------------------------------------------------------------
 # 语音配置
 # 包含 TTS（文字转语音）与 STT（语音转文字）子系统
@@ -218,8 +223,8 @@ voice:
 system:
   # 是否启用 Windows 系统控制意图（关闭后相关指令不执行）
   # 有效值：true | false
-  # 默认：true
-  windows_control_enabled: true
+  # 默认：false；个人使用时按需显式开启
+  windows_control_enabled: false
 
   # 关机/重启/锁屏前是否弹出二次确认
   # 有效值：true | false（强烈建议保持 true）
@@ -245,8 +250,8 @@ security:
 
     # 电源操作：关机、重启、锁屏（仍受 system.require_confirmation 约束）
     # 有效值：true | false
-    # 默认：false（代码默认）；本文件示例为 true
-    system_power: true
+    # 默认：false
+    system_power: false
 
     # 启动子进程（浏览器、RVC CLI、外部程序等）
     # 有效值：true | false
@@ -260,8 +265,8 @@ security:
 
     # 打开系统默认或指定浏览器
     # 有效值：true | false
-    # 默认：true
-    browser_launch: true
+    # 默认：false；搜索结果仍可打印 URL
+    browser_launch: false
 
     # 删除文件（仅限白名单目录：logs、data/tmp、data/test）
     # 有效值：true | false
@@ -270,8 +275,8 @@ security:
 
     # 修改当前进程环境变量（RVC 子进程、PATH 等）
     # 有效值：true | false
-    # 默认：true
-    env_modify: true
+    # 默认：false
+    env_modify: false
 
 # -----------------------------------------------------------------------------
 # 搜索配置
@@ -290,8 +295,8 @@ search:
 
   # 识别到搜索意图后是否自动打开浏览器
   # 有效值：true | false
-  # 默认：true
-  auto_open: true
+  # 默认：false；仅返回 URL，不自动启动外部程序
+  auto_open: false
 
 # -----------------------------------------------------------------------------
 # 扩展功能配置
@@ -401,9 +406,22 @@ assistant:
     # 默认：10
     interval_minutes: 10
 
+    # 启动时是否由后台 Timer 立即跑一轮（调用线程仍不同步无界扫描）
+    # 默认：false
+    cleanup_on_start: false
+
+    # 每轮最大扫描文件数（所有规则合计）
+    # 默认：500
+    max_scan_files: 500
+
+    # 每轮最大删除文件数
+    # 默认：100
+    max_delete_files: 100
+
     # data/tmp 下临时音频文件最大保留时间（小时）
     # 有效值：正浮点数
     # 默认：1.0
+    # 注意：只清理 data/tmp，不清理仓库根 tmp/
     tmp_max_age_hours: 1.0
 
     # logs/ 下过期日志最大保留天数
@@ -415,3 +433,48 @@ assistant:
     # 有效值：正数
     # 默认：72
     test_max_age_hours: 72
+
+# -----------------------------------------------------------------------------
+# 长期记忆
+# 启用后：请求前有界词法召回注入 system；成功完整轮次异步提取落库。
+# 后台提取可能与前台生成争用同一 Ollama/GPU，本配置不解决优先级调度。
+# -----------------------------------------------------------------------------
+memory:
+  # 是否启用长期记忆产品接线
+  # 当前个人配置已启用；关闭后不创建数据库、不启动提取线程、不包装 LLM
+  enabled: true
+
+  # 正式 SQLite 数据库；诊断库 tmp/memory-live-test.sqlite3 不用于主程序
+  db_path: data/memory/long_term.sqlite3
+
+  recall:
+    max_entries: 8
+    max_chars: 1200
+    candidate_limit: 200
+
+  ingestion:
+    queue_capacity: 32
+    max_extractions_per_turn: 16
+    close_drain: true
+    close_timeout: 5.0
+
+  extractor:
+    # 空值回退到 ollama.* 对应项（model/base_url/timeout/keep_alive）
+    # num_ctx: null = 继承模型/服务 context（不写入 options），避免同模型 8192↔2048 重建 runner
+    # 显式正整数仍写入请求；num_predict 限制生成长度，默认保留
+    base_url: null
+    model: null
+    timeout: null
+    keep_alive: null
+    num_ctx: null
+    num_predict: 512
+
+  # 有界保留与低干扰维护
+  # 仅在空闲且无前台请求时定期 prune；仍保护 USER_CONFIRMED。
+  retention:
+    enabled: true
+    max_records: 2000
+    max_age_days: 365
+    maintenance_interval_hours: 24
+    preserve_user_confirmed: true
+    batch_limit: 64

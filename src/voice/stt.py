@@ -279,7 +279,7 @@ class STTEngine:
             if not isinstance(text, str) or not text.strip():
                 self.logger.info("未能识别语音内容，请再说一次")
                 return RecognitionResult.failure(RecognitionStatus.UNRECOGNIZED)
-            self.logger.info("识别结果: %s", text)
+            self.logger.info("语音识别成功 chars=%d", len(text))
             return RecognitionResult.success(text)
         except sr.UnknownValueError:
             self.logger.info("未能识别语音内容，请再说一次")
@@ -310,7 +310,7 @@ class STTEngine:
             text = (result.get("text") or "").strip()
             if not text:
                 return RecognitionResult.failure(RecognitionStatus.UNRECOGNIZED)
-            self.logger.info("识别结果: %s", text)
+            self.logger.info("语音识别成功 chars=%d", len(text))
             return RecognitionResult.success(text)
         except Exception as exc:
             self.logger.error("Whisper 识别失败: %s", exc, exc_info=True)
