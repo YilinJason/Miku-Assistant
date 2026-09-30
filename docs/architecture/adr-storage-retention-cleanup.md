@@ -27,6 +27,6 @@
 
 恢复无上限的 `ConversationHistory` / 旧 `FileCleaner` / 旧 `TempFileManager`；关闭 `memory.retention`；删除本 ADR。
 
-## 明确未做（Round 2/3）
+## 明确未做（Round 3）
 
-按模式装配、RVC/GPU 协调、子进程能力收窄、远端 HTTP 策略、日志隐私强化。
+按模式装配与资源协调见 `docs/architecture/adr-mode-assembly-resource-ownership.md`（Round 2 已采纳）。本 ADR 仍不覆盖：RVC/GPU 子进程 SafetyPolicy 能力收窄、远端 HTTP 策略、日志隐私强化。

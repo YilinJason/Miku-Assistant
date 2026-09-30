@@ -8,20 +8,31 @@
 装配失败时按登记顺序的逆序回收本层已成功创建的 TTS / 角色 / 清理器
 （仅 ``stop_auto_cleanup``，不调用 ``cleanup_now``）。构造器抛错且未返回
 对象时，其内部泄漏不在本模块回收范围内。
+
+Round 2：``startup_mode`` 在装配前可知；``text``/``interactive`` 不构造
+STT/TTS/AudioPlayer/RVC；``voice`` 同步构造；Ollama/RVC 预热按资源配置串行。
 """
 from __future__ import annotations
 
+import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Tuple
 
 from src.core.config import Config
 from src.core.file_cleaner import FileCleaner
 from src.core.logging_setup import setup_app_logging
 from src.core.paths import RUNTIME_DATA_DIRS, ensure_runtime_dirs, runtime_layout_summary
+from src.core.resource_coord import run_coordinated_warmup
+from src.core.resource_settings import ResourceSettings, parse_resource_settings
 from src.core.router import IntentRouter
 from src.core.router_factory import build_intent_router
 from src.core.safety import SafetyPolicy
+from src.core.startup_mode import (
+    StartupMode,
+    normalize_startup_mode,
+    voice_stack_at_assemble,
+)
 from src.extensions.character_interface import CharacterInterface
 from src.llm.ollama_client import OllamaClient
 from src.memory.runtime import MemoryRuntime, parse_memory_settings
@@ -48,6 +59,11 @@ class AssembledParts:
     router: IntentRouter
     logger: Optional[Any] = None
     memory_runtime: Optional[Any] = None
+    startup_mode: StartupMode = "interactive"
+    resource_settings: Optional[ResourceSettings] = None
+    voice_autoload_enabled: bool = False
+    tts_engine_cls: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    stt_engine_cls: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
 
 class _RollbackRegistry:
@@ -80,9 +96,111 @@ class _RollbackRegistry:
                 )
 
 
+def _callable_accepts_stop_rvc(shutdown: Callable[..., Any]) -> bool:
+    """调用前判断是否接受 ``stop_rvc``；不得用运行时 TypeError 决定是否重试。"""
+    try:
+        signature = inspect.signature(shutdown)
+    except (TypeError, ValueError):
+        return False
+    params = signature.parameters
+    if "stop_rvc" in params:
+        return True
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _shutdown_engine(engine: Any, *, stop_rvc: bool = True) -> None:
+    """
+    尽力关闭引擎；忽略单项失败。单次回收最多调用一次 ``shutdown``。
+
+    未发布且已有正式 TTS 时传 ``stop_rvc=False``，避免误停其 Worker；
+    本轮唯一未发布 TTS 应传 ``stop_rvc=True`` 以回收可能已预热的 Worker。
+    """
+    if engine is None:
+        return
+    shutdown = getattr(engine, "shutdown", None)
+    if not callable(shutdown):
+        return
+    try:
+        if _callable_accepts_stop_rvc(shutdown):
+            shutdown(stop_rvc=stop_rvc)
+        else:
+            shutdown()
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "voice engine shutdown during rollback failed", exc_info=True
+        )
+
+
+def build_tts_engine(
+    config: Any,
+    safety_policy: SafetyPolicy,
+    *,
+    tts_engine_cls: Callable[..., Any] = TTSEngine,
+    warm_rvc_on_init: bool = False,
+) -> Any:
+    """仅构造 TTS（含可选 AudioPlayer/RVC 绑定），不预热 Worker。"""
+    tts_config = config.get("voice.tts", {}) or {}
+    return tts_engine_cls(
+        engine=tts_config.get("engine", "edge-tts"),
+        language=tts_config.get("language", "zh-CN"),
+        rate=tts_config.get("rate", 150),
+        volume=tts_config.get("volume", 0.8),
+        voice=tts_config.get("voice", "zh-CN-XiaoxiaoNeural"),
+        rvc_config=config.get_rvc_config() if hasattr(config, "get_rvc_config") else None,
+        fallback_enabled=tts_config.get("fallback_enabled", True),
+        fallback_engine=tts_config.get("fallback_engine", "pyttsx3"),
+        pipeline_enabled=tts_config.get("pipeline_enabled", True),
+        safety_policy=safety_policy,
+        warm_rvc_on_init=warm_rvc_on_init,
+    )
+
+
+def build_stt_engine(
+    config: Any,
+    *,
+    stt_engine_cls: Callable[..., Any] = STTEngine,
+) -> Any:
+    stt_config = config.get("voice.stt", {}) or {}
+    return stt_engine_cls(
+        engine=stt_config.get("engine", "speech_recognition"),
+        language=stt_config.get("language", "zh-CN"),
+        energy_threshold=stt_config.get("energy_threshold", 4000),
+    )
+
+
+def build_voice_engines(
+    config: Any,
+    safety_policy: SafetyPolicy,
+    *,
+    tts_engine_cls: Callable[..., Any] = TTSEngine,
+    stt_engine_cls: Callable[..., Any] = STTEngine,
+    warm_rvc_on_init: bool = False,
+) -> Tuple[Any, Any]:
+    """
+    构造 TTS/STT；默认不在构造期预热 RVC。
+
+    事务式：STT 失败时 exactly-once 关闭本轮已创建的 TTS，避免泄漏。
+    """
+    tts_engine = build_tts_engine(
+        config,
+        safety_policy,
+        tts_engine_cls=tts_engine_cls,
+        warm_rvc_on_init=warm_rvc_on_init,
+    )
+    try:
+        stt_engine = build_stt_engine(config, stt_engine_cls=stt_engine_cls)
+    except Exception:
+        _shutdown_engine(tts_engine)
+        raise
+    return tts_engine, stt_engine
+
+
 def assemble_default(
     config_path: Optional[str] = None,
     *,
+    startup_mode: object = "interactive",
     config_loader: Optional[Callable[[Optional[str]], Any]] = None,
     logging_setup: Optional[Callable[[Any], Any]] = None,
     dir_preparer: Optional[Callable[[], None]] = None,
@@ -96,13 +214,19 @@ def assemble_default(
     router_builder: Optional[Callable[..., IntentRouter]] = None,
     start_cleaner: bool = True,
     memory_runtime_factory: Optional[Callable[..., Any]] = None,
+    warmup_events: Optional[List[str]] = None,
 ) -> AssembledParts:
     """
     按配置创建并连接默认运行时组件（含副作用）。
 
+    ``startup_mode``：
+    - ``text`` / ``interactive``：不构造 STT/TTS/RVC；可经助手懒加载。
+    - ``voice``：装配期构造语音栈。
+
     ``memory.enabled=false``（默认）时不创建记忆库、不启动提取线程、不包装 LLM。
     启用时先校验 memory 配置，再创建 runtime，并在后续组件失败时逆序回滚。
     """
+    mode = normalize_startup_mode(startup_mode)
     load_config = config_loader or Config
     setup_logging = logging_setup or setup_app_logging
     prepare_dirs = dir_preparer or ensure_runtime_dirs
@@ -112,9 +236,10 @@ def assemble_default(
     config = load_config(config_path)
     safety_policy = SafetyPolicy.from_app_config(config)
 
-    # memory 配置在任何设备工厂之前校验；未启用则零开销
+    # memory / resource 配置在任何设备工厂之前校验；未启用则零开销
     memory_settings = parse_memory_settings(config)
     memory_enabled = memory_settings.enabled
+    resource_settings = parse_resource_settings(config)
 
     log_file = setup_logging(config)
 
@@ -124,12 +249,20 @@ def assemble_default(
 
     logger = logging.getLogger("src.core.assembly")
     logger.info(runtime_layout_summary())
+    logger.info(
+        "装配启动模式=%s voice_at_assemble=%s resource.profile=%s",
+        mode,
+        voice_stack_at_assemble(mode),
+        resource_settings.profile,
+    )
     if log_file:
         logger.info("崩溃排查请查看日志文件: %s", log_file)
     logger.debug("安全策略: %s", safety_policy.summary())
 
     rollback = _RollbackRegistry(logger)
     memory_runtime = None
+    tts_engine = None
+    stt_engine = None
 
     try:
         from src.llm.conversation_history import (
@@ -173,29 +306,41 @@ def assemble_default(
                     memory_settings.retention_preserve_user_confirmed,
                 )
 
-        tts_config = config.get("voice.tts", {}) or {}
-        tts_engine = tts_engine_cls(
-            engine=tts_config.get("engine", "edge-tts"),
-            language=tts_config.get("language", "zh-CN"),
-            rate=tts_config.get("rate", 150),
-            volume=tts_config.get("volume", 0.8),
-            voice=tts_config.get("voice", "zh-CN-XiaoxiaoNeural"),
-            rvc_config=config.get_rvc_config(),
-            fallback_enabled=tts_config.get("fallback_enabled", True),
-            fallback_engine=tts_config.get("fallback_engine", "pyttsx3"),
-            pipeline_enabled=tts_config.get("pipeline_enabled", True),
-            safety_policy=safety_policy,
-        )
-        rollback.register("tts_engine.shutdown", tts_engine.shutdown)
-        logger.info("TTS 模块初始化成功")
+        if voice_stack_at_assemble(mode):
+            # 构造期不预热 RVC；交由串行协调器，避免与 Ollama 并行抢 GPU
+            tts_config = config.get("voice.tts", {}) or {}
+            tts_engine = tts_engine_cls(
+                engine=tts_config.get("engine", "edge-tts"),
+                language=tts_config.get("language", "zh-CN"),
+                rate=tts_config.get("rate", 150),
+                volume=tts_config.get("volume", 0.8),
+                voice=tts_config.get("voice", "zh-CN-XiaoxiaoNeural"),
+                rvc_config=(
+                    config.get_rvc_config()
+                    if hasattr(config, "get_rvc_config")
+                    else None
+                ),
+                fallback_enabled=tts_config.get("fallback_enabled", True),
+                fallback_engine=tts_config.get("fallback_engine", "pyttsx3"),
+                pipeline_enabled=tts_config.get("pipeline_enabled", True),
+                safety_policy=safety_policy,
+                warm_rvc_on_init=False,
+            )
+            rollback.register("tts_engine.shutdown", tts_engine.shutdown)
+            logger.info("TTS 模块初始化成功（voice 模式）")
 
-        stt_config = config.get("voice.stt", {}) or {}
-        stt_engine = stt_engine_cls(
-            engine=stt_config.get("engine", "speech_recognition"),
-            language=stt_config.get("language", "zh-CN"),
-            energy_threshold=stt_config.get("energy_threshold", 4000),
-        )
-        logger.info("STT 模块初始化成功")
+            stt_config = config.get("voice.stt", {}) or {}
+            stt_engine = stt_engine_cls(
+                engine=stt_config.get("engine", "speech_recognition"),
+                language=stt_config.get("language", "zh-CN"),
+                energy_threshold=stt_config.get("energy_threshold", 4000),
+            )
+            logger.info("STT 模块初始化成功（voice 模式）")
+        else:
+            logger.info(
+                "跳过 TTS/STT/RVC 构造（startup_mode=%s）；首次进入语音时懒加载",
+                mode,
+            )
 
         windows_controller = None
         if config.get("system.windows_control_enabled", False):
@@ -240,6 +385,15 @@ def assemble_default(
             safety_policy=safety_policy,
         )
 
+        # text：仅 Ollama；voice：串行 Ollama↔RVC；interactive 延迟到懒加载
+        run_coordinated_warmup(
+            llm_client=llm_client,
+            tts_engine=tts_engine,
+            settings=resource_settings,
+            log=logger,
+            events=warmup_events,
+        )
+
         parts = AssembledParts(
             config=config,
             safety_policy=safety_policy,
@@ -254,21 +408,12 @@ def assemble_default(
             router=router,
             logger=None,
             memory_runtime=memory_runtime,
+            startup_mode=mode,
+            resource_settings=resource_settings,
+            voice_autoload_enabled=not voice_stack_at_assemble(mode),
+            tts_engine_cls=tts_engine_cls,
+            stt_engine_cls=stt_engine_cls,
         )
-        if config.get("ollama.warmup_on_start", True):
-            start_warmup = getattr(llm_client, "start_warmup", None)
-            if callable(start_warmup):
-                try:
-                    started = start_warmup(
-                        timeout=float(config.get("ollama.warmup_timeout", 120.0))
-                    )
-                    if started is not False:
-                        logger.info("Ollama 模型后台预热已启动")
-                except Exception as exc:
-                    logger.warning(
-                        "Ollama 模型后台预热启动失败（正式请求仍可继续）: %s",
-                        exc,
-                    )
         rollback.abandon()
         return parts
     except Exception:

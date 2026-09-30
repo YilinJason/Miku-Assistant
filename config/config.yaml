@@ -478,3 +478,23 @@ memory:
     maintenance_interval_hours: 24
     preserve_user_confirmed: true
     batch_limit: 64
+
+# -----------------------------------------------------------------------------
+# 资源协调（Round 2）
+# profile=balanced：Ollama 与 RVC 串行预热，退出默认不卸载模型驻留。
+# unload_on_exit 默认 false，且不会因 profile 暗中开启。
+# 若显式 true：对共享 Ollama 中指定模型发出 best-effort keep_alive=0（可能影响同名其他客户端），不停止 Ollama 服务。
+# -----------------------------------------------------------------------------
+resource:
+  profile: balanced
+  ollama:
+    # null/缺省时回退 ollama.warmup_on_start
+    warmup_on_start: true
+    unload_on_exit: false
+  rvc:
+    warmup_on_voice_start: true
+  warmup:
+    serialize_gpu: true
+    order: ollama_then_rvc
+    # null/缺省时回退 ollama.warmup_timeout
+    timeout: 120

@@ -188,6 +188,26 @@ class MemoryAwareLLMClient:
             return start()
         return start(timeout=timeout)
 
+    def wait_for_warmup(self, *, timeout: Optional[float] = None) -> bool:
+        wait = getattr(self._inner, "wait_for_warmup", None)
+        if not callable(wait):
+            return True
+        if timeout is None:
+            return bool(wait())
+        return bool(wait(timeout=timeout))
+
+    def release_owned_model(self) -> bool:
+        release = getattr(self._inner, "release_owned_model", None)
+        if not callable(release):
+            return False
+        return bool(release())
+
+    def model_touch_succeeded(self) -> bool:
+        touched = getattr(self._inner, "model_touch_succeeded", None)
+        if callable(touched):
+            return bool(touched())
+        return bool(getattr(self._inner, "_model_touch_succeeded", False))
+
     @property
     def model(self) -> Any:
         """显式代理底层模型名，供 CLI / 语音预检使用。"""

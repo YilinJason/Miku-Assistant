@@ -617,6 +617,7 @@ class AssemblyAndShutdownTests(unittest.TestCase):
                 pass
 
         parts = assemble_default(
+            startup_mode="text",
             config_loader=lambda _p: _cfg(memory_enabled=False),
             logging_setup=lambda _c: None,
             dir_preparer=lambda: None,
@@ -689,6 +690,7 @@ class AssemblyAndShutdownTests(unittest.TestCase):
                 return runtime
 
             parts = assemble_default(
+                startup_mode="voice",
                 config_loader=lambda _p: cfg,
                 logging_setup=lambda _c: None,
                 dir_preparer=lambda: None,
@@ -712,6 +714,7 @@ class AssemblyAndShutdownTests(unittest.TestCase):
             device_calls.clear()
             with self.assertRaises(MemoryValidationError):
                 assemble_default(
+                    startup_mode="voice",
                     config_loader=lambda _p: bad,
                     logging_setup=lambda _c: None,
                     dir_preparer=lambda: None,
@@ -768,6 +771,7 @@ class AssemblyAndShutdownTests(unittest.TestCase):
 
             with self.assertRaises(RuntimeError):
                 assemble_default(
+                    startup_mode="voice",
                     config_loader=lambda _p: cfg,
                     logging_setup=lambda _c: None,
                     dir_preparer=lambda: None,
@@ -966,6 +970,7 @@ class ConfigAndRuntimeFaultTests(unittest.TestCase):
         bad.data["memory"]["recall"]["max_entries"] = True
         with self.assertRaises(MemoryValidationError):
             assemble_default(
+                startup_mode="voice",
                 config_loader=lambda _p: bad,
                 logging_setup=lambda _c: None,
                 dir_preparer=lambda: None,

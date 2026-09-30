@@ -40,6 +40,7 @@ class TTSEngine:
         pipeline_enabled: bool = True,
         safety_policy: Optional[SafetyPolicy] = None,
         temp_file_manager: Optional[TempFileManager] = None,
+        warm_rvc_on_init: bool = True,
     ):
         """
         初始化 TTS 引擎。
@@ -56,6 +57,8 @@ class TTSEngine:
             pipeline_enabled: 是否启用分句流水线播报。
             safety_policy: 安全策略；影响临时文件删除与播放后端。
             temp_file_manager: 可选外部临时文件管理器；传入时本引擎不拥有其生命周期。
+            warm_rvc_on_init: 为 ``False`` 时跳过构造期 RVC 健康检查/Worker 预热，
+                由资源协调器稍后调用 ``prepare_rvc``（按模式串行，避免与 Ollama 抢 GPU）。
         """
         if engine in _LEGACY_ENGINES:
             logging.getLogger(__name__).warning(
@@ -96,36 +99,54 @@ class TTSEngine:
         )
         self._rvc_ready = False
         self._rvc_last_error: Optional[str] = None
+        self._rvc_prepare_done = False
         self._speak_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._interrupt_event = threading.Event()
         self._interrupt_epoch_lock = threading.Lock()
         self._interrupt_epoch = 0
 
-        if self._rvc and self._rvc.enabled:
-            from src.voice.rvc.health_check import check_rvc_health
-
-            report = check_rvc_health(self._rvc_config)
-            self._rvc_ready = report.ok
-            if not report.ok:
-                self._rvc_last_error = report.summary()
-                self.logger.error("%s", self._rvc_last_error)
-            else:
-                self.logger.info("RVC Nahida 模型与环境检查通过")
-                if self._rvc_config.get("prewarm_audio_processing", False):
-                    try:
-                        with log_elapsed("MP3→WAV 重采样预热"):
-                            warm_audio_preprocessing(
-                                int(self._rvc_config.get("input_sample_rate", 40000))
-                            )
-                    except Exception as exc:
-                        self.logger.warning("音频重采样预热失败，真实请求仍可继续: %s", exc)
-                if self._rvc_config.get("worker_enabled", True):
-                    from src.voice.rvc.infer import warm_rvc_worker
-
-                    warm_rvc_worker(self._rvc_config)
+        if warm_rvc_on_init:
+            self.prepare_rvc()
 
         self._initialize_engine()
+
+    def prepare_rvc(self) -> bool:
+        """
+        执行 RVC 健康检查与可选 Worker 预热（幂等）。
+
+        装配期可设 ``warm_rvc_on_init=False``，由资源协调器在 Ollama 预热之后调用，
+        避免默认并行抢占 GPU。
+        """
+        if self._rvc_prepare_done:
+            return self._rvc_ready
+        self._rvc_prepare_done = True
+        if not (self._rvc and self._rvc.enabled):
+            return False
+
+        from src.voice.rvc.health_check import check_rvc_health
+
+        report = check_rvc_health(self._rvc_config)
+        self._rvc_ready = report.ok
+        if not report.ok:
+            self._rvc_last_error = report.summary()
+            self.logger.error("%s", self._rvc_last_error)
+            return False
+
+        self.logger.info("RVC Nahida 模型与环境检查通过")
+        if self._rvc_config.get("prewarm_audio_processing", False):
+            try:
+                with log_elapsed("MP3→WAV 重采样预热"):
+                    warm_audio_preprocessing(
+                        int(self._rvc_config.get("input_sample_rate", 40000))
+                    )
+            except Exception as exc:
+                self.logger.warning("音频重采样预热失败，真实请求仍可继续: %s", exc)
+        if self._rvc_config.get("worker_enabled", True):
+            from src.voice.rvc.infer import warm_rvc_worker
+
+            warm_rvc_worker(self._rvc_config)
+        return self._rvc_ready
 
     def _initialize_engine(self) -> None:
         """按 ``engine_type`` 初始化 edge-tts 或 pyttsx3。"""
@@ -452,14 +473,20 @@ class TTSEngine:
             return self._rvc.convert_file(input_audio)
         return None
 
-    def shutdown(self) -> None:
-        """停止新合成、当前 pygame 播放与 RVC Worker；回收自有 TempFileManager。可重复调用。"""
+    def shutdown(self, *, stop_rvc: bool = True) -> None:
+        """
+        停止新合成与当前播放；回收自有 TempFileManager。可重复调用。
+
+        ``stop_rvc=True``（默认）：本实例拥有可能已预热的全局 Worker 时停止它。
+        ``stop_rvc=False``：仅当丢弃重复实例且正式 TTS 仍保留 Worker 时使用。
+        """
         self._shutdown_event.set()
         self._signal_interrupt()
         self._player.stop()
-        from src.voice.rvc.infer import stop_rvc_worker
+        if stop_rvc:
+            from src.voice.rvc.infer import stop_rvc_worker
 
-        stop_rvc_worker()
+            stop_rvc_worker()
         owns = getattr(self, "_owns_temp_files", True)
         done = getattr(self, "_temp_files_shutdown_done", False)
         temp_files = getattr(self, "_temp_files", None)

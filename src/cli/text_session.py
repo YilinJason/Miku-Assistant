@@ -113,7 +113,26 @@ def run_interactive_session(
     print("输入 'stream' 切换增量显示与分句播报")
     print("提示: 输入'开启语音模式'或'关闭语音模式'可以切换模式")
 
-    auto_tts = assistant.config.get("assistant.auto_tts", False)
+    want_auto_tts = bool(assistant.config.get("assistant.auto_tts", False))
+    auto_tts = False
+    tts_fail_notified = False
+    if want_auto_tts:
+        load = assistant.ensure_tts_for_playback()
+        if load.ok and assistant.tts_engine is not None:
+            auto_tts = True
+            assistant.config.set("assistant.auto_tts", True)
+            print("自动语音输出: 开启")
+        else:
+            assistant.config.set("assistant.auto_tts", False)
+            tts_fail_notified = True
+            print(
+                "自动语音输出: 关闭（TTS 尚未就绪："
+                + ("; ".join(load.errors) if load.errors else "未加载")
+                + "）。输入 'tts' 可重试。"
+            )
+    else:
+        print("自动语音输出: 关闭")
+
     stream_on = bool(
         stream_reply or assistant.config.get("assistant.stream_reply", False)
     )
@@ -140,9 +159,29 @@ def run_interactive_session(
                 continue
 
             if user_input.lower() == "tts":
-                auto_tts = not auto_tts
-                assistant.config.set("assistant.auto_tts", auto_tts)
-                print(f"自动语音输出: {'开启' if auto_tts else '关闭'}")
+                if auto_tts:
+                    auto_tts = False
+                    assistant.config.set("assistant.auto_tts", False)
+                    print("自动语音输出: 关闭")
+                else:
+                    # 显式 tts：允许清除本会话自动失败封锁后重试
+                    load = assistant.ensure_tts_for_playback(allow_retry=True)
+                    if load.ok and assistant.tts_engine is not None:
+                        auto_tts = True
+                        assistant.config.set("assistant.auto_tts", True)
+                        tts_fail_notified = False
+                        print("自动语音输出: 开启")
+                    else:
+                        auto_tts = False
+                        assistant.config.set("assistant.auto_tts", False)
+                        if not tts_fail_notified:
+                            tts_fail_notified = True
+                            print(
+                                "自动语音输出仍关闭："
+                                + ("; ".join(load.errors) if load.errors else "TTS 不可用")
+                            )
+                        else:
+                            print("自动语音输出: 关闭（TTS 仍不可用）")
                 continue
 
             if user_input.lower() == "stream":

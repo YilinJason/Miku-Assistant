@@ -1,5 +1,126 @@
 # Cursor 交接状态
 
+## 2026-09-29 Codex 最终验收：存储硬化 Round 2 通过
+
+- **结论**：Round 2 离线工程验收通过，无剩余阻断项；F1-A/B/C/D 独立反例全部转绿
+- **独立验证**：专项 39 tests / OK；全量 418 tests / OK；无 `ResourceWarning`；compileall / `git diff --check` OK
+- **soak**：`ok=true`、`bounds_ok=true`、`reclaim_ok=true`、`weakrefs_alive_after_shutdown=0`；本次 RSS 增长约 0.4 MiB，线程/直属子进程无增长
+- **边界**：未运行真实 Ollama/RVC/音频设备及 30～60 分钟真实语音 soak；未读/未删 `data/memory`；未提交、未推送；Round 3 未开始
+
+---
+
+## 2026-09-29 Round 2 二次复验 F1 协议收口：完成，等待 Codex 复验
+
+- **任务入口**：`docs/cursor-review-storage-performance-security-round2-final.md` 顶部「2026-09-29 二次复验」
+- **状态**：一次性修复 F1-A/B/C/D；**保留已通过的 F2/F3/F4**；**停止等待 Codex 复验**；**未进入 Round 3**
+- **保留**：`memory.enabled=true`、`retention.enabled=true`；未读/未删 `data/memory`；未提交、未推送
+
+### 四条对照
+1. **F1-A**：未发布且尚无正式 TTS 时 `_discard_unpublished_tts` → `stop_rvc=True`；shutdown-prewarm 后 `worker_alive=False`
+2. **F1-B**：两者皆缺走 `_ensure_voice_stack_both` 事务；STT 失败回收局部 TTS；已有 TTS 仅补 STT 失败时不关正式 TTS
+3. **F1-C**：shutdown 设置 closing 后 `_wake_voice_loaders()`；等待使用单一 `VOICE_LOAD_WAIT_SECONDS` deadline
+4. **F1-D**：`_shutdown_engine` 用 `inspect.signature` 判断 `stop_rvc`；内部 TypeError 不重试，`calls==1`
+
+### 确定性测试（新增）
+- `FinalF1AShutdownPrewarmTests.test_shutdown_during_prewarm_stops_worker`
+- `FinalF1BTransactionalVoiceTests.test_both_missing_stt_failure_rolls_back_tts` / `test_existing_tts_stt_failure_keeps_published_tts`
+- `FinalF1CWaiterWakeTests.test_waiter_returns_promptly_after_shutdown`
+- `FinalF1DShutdownExactlyOnceTests.test_internal_typeerror_shutdown_exactly_once`
+
+### 离线验证
+- `unittest discover -s tests -q` → **418 tests / OK**（此前 413；新增 FinalF1A–D）
+- `compileall` OK；soak JSON：`ok=true` / `bounds_ok=true` / `reclaim_ok=true` / `weakrefs_alive_after_shutdown=0`
+- `git diff --check` OK（仅 LF/CRLF 提示）
+- **未运行**：真实 Ollama、RVC、麦克风/扬声器、浏览器、清理实扫
+
+---
+
+## 2026-09-29 Codex Round 2 二次最终复验：F1 生命周期仍需收口（历史）
+
+- **任务入口**：`docs/cursor-review-storage-performance-security-round2-final.md` 顶部“二次复验”
+- **已通过**：有界 SessionTimer、weakref/reclaim soak、cleaner 关闭、显式 TTS 重试、closing 优先检查；soak `ok=true / alive=0`
+- **仍阻断**：shutdown-prewarm 遗留 Worker；双缺失时 STT 失败留下 TTS；loader 等待者关闭后不醒且无总 deadline；内部 `TypeError` 导致 shutdown 调用两次
+- **状态**：已被上方 F1 协议收口条目承接
+
+---
+
+## 2026-09-29 存储硬化 Round 2 最终收口：完成，等待 Codex 最终复验
+
+- **任务入口**：`docs/cursor-review-storage-performance-security-round2-final.md`
+- **状态**：一次性修复全部 4 组 Round 2 收口 finding；**停止等待 Codex 最终复验**；**未进入 Round 3**
+- **保留**：`memory.enabled=true`、`retention.enabled=true`、`.gitignore` 隐私规则与私人库；未读/未删 `data/memory`；未提交、未推送
+- **离线验证**：`Python312 -X utf8 -m unittest discover -s tests -q` → **413 tests / OK**；`compileall` OK；`diagnose_resource_soak.py --turns 1000 --fails 100 --json` → `ok=true` 且 `weakrefs_alive_after_shutdown=0`；`git diff --check` OK
+- **未运行**：真实 Ollama、主程序、RVC、麦克风/扬声器、浏览器、清理实扫
+
+### 四组收口对照
+1. **F1**：`ensure_tts`/`ensure_voice_stack` 共用 loader single-flight；已有 TTS 仅补 STT；未发布 TTS `shutdown(stop_rvc=False)`；顺序/并发/构造中 shutdown 回归
+2. **F2**：`SessionTimer` 硬上限（默认 64）+ FIFO 淘汰；构造校验；10k 写入后记录数 ≤ 上限
+3. **F3**：soak 删除强引用 + `gc.collect()`；`ok` 要求 `weakrefs_alive==0`；长目录 cleaner `try/finally stop_auto_cleanup`
+4. **F4**：显式 `tts` 走 `allow_retry=True`；ensure 先查 closing；shutdown 后即使引擎仍绑定也失败
+
+### 关键测试
+- `tests/test_storage_round2_review_fixes.py`（F1 单飞/竞态、F2 容量、F3 真回收、F4 显式重试与关闭契约）
+- `tests/test_mode_assembly_round2.py`（cleaner finally）
+
+---
+
+## 2026-09-29 Codex Round 2 最终复验：仍需一次收口（历史）
+
+- **任务入口**：`docs/cursor-review-storage-performance-security-round2-final.md`
+- **结论**：原 7 项中 F3/F6/F7 通过；Windows RSS/子进程 fallback 可观测。F1/F2/F4/F5 仍有 4 组确定性问题，Round 2 暂不通过
+- **状态**：已被上方最终收口条目承接
+
+---
+
+## 2026-09-29 存储硬化 Round 2 评审修复：完成，等待 Codex 最终复验
+
+- **状态**：已按 `docs/cursor-review-storage-performance-security-round2.md` **一次性修复全部 7 个 finding**；**停止等待 Codex 最终复验**；**未进入 Round 3**
+- **保留**：`memory.enabled=true`、`retention.enabled=true`；未读/未删 `data/memory`；未提交、未推送
+- **离线验证**：`Python312 -X utf8 -m unittest discover -s tests -q` → **407 tests / OK**（此前 392）；`compileall` OK；`git diff --check` OK
+- **未运行**：真实 Ollama、主程序、麦克风/扬声器、RVC、浏览器、清理实扫
+
+### Finding 对照
+1. **F1**：`build_voice_engines` / `ensure_*` 事务式回滚；`_lifecycle_lock` 与 shutdown 协议；竞态丢弃未发布 TTS（`test_storage_round2_review_fixes.Finding1*`）
+2. **F2**：`ensure_tts_for_playback` + `_apply_outcome_side_effects` / 流式路径按需加载；CLI 仅在资源可用时显示开启（`Finding2*` + `text_session`）
+3. **F3**：wait 结果结构化；超时/失败跳过 RVC；KI/SystemExit 上抛（`Finding3*`）
+4. **F4**：Windows RSS/子进程 WinAPI fallback；不可观测为 null；`diagnose_resource_soak.py` 真 soak；真实 `collect_assistant_queue_depths`（`Finding4*`）
+5. **F5**：生产非流式/流式 `request`/`request_stream` 计时；`counts_as_request` 冷热（`Finding5*`）
+6. **F6**：`math.isfinite` 拒绝 Inf/NaN（`Finding6*`）
+7. **F7**：unload 须显式配置；须曾触达模型；文档改为 shared best-effort（`Finding7*` + ADR）
+
+### 新增测试
+- `tests/test_storage_round2_review_fixes.py`
+
+---
+
+## 2026-09-29 Codex Review：存储硬化 Round 2 暂不通过（历史）
+
+- **修复单**：`docs/cursor-review-storage-performance-security-round2.md`
+- **状态**：已被上方评审修复条目承接
+
+---
+
+## 2026-09-28 存储硬化 Round 2：按模式装配与资源协调 — 完成，等待 Codex Review
+
+- **状态**：已按 `docs/cursor-next-storage-performance-security-hardening.md` **仅执行 Round 2**；**停止等待 Codex Review**；**未进入 Round 3**
+- **保留**：`memory.enabled=true`、`retention.enabled=true` 与现有全部修改；**未删除/未读取** `data/memory` 私人数据
+- **离线验证**：`Python312 -X utf8 -m unittest discover -s tests -q` → **392 tests / OK**（此前里程碑约 379）；`compileall` OK；`git diff --check` OK（仅 LF/CRLF 提示）
+- **未运行**：真实 Ollama、主程序、麦克风/扬声器、RVC 实机、浏览器、系统电源、清理实扫；未提交、未推送
+
+### 实际修改
+1. **模式装配**：`startup_mode` 在装配前可知；`text`/`interactive` 不构造 STT/TTS/AudioPlayer/RVC；`voice` 同步构造；`ensure_voice_stack()` 懒加载 + 结构化失败
+2. **资源协调**：`resource.profile=balanced`；`serialize_gpu` + `ollama_then_rvc`；TTS `warm_rvc_on_init=False` + `prepare_rvc()`；退出 `unload_on_exit` 仅 `keep_alive=0`，不停 Ollama 服务
+3. **观测**：`SessionTimer`（仅 ID/阶段耗时）；`resource_soak` / `diagnose_resource_soak.py`（RSS/线程/子进程/队列）
+4. **文档**：`docs/architecture/adr-mode-assembly-resource-ownership.md`；`config`/`Config` 默认；工程基线；本交接
+
+### 测试
+- 新增 `tests/test_mode_assembly_round2.py`（模式装配、串行预热、fake unload HTTP、10k 文本 soak、清理器长目录有界）
+
+### 剩余风险
+- 未做 30～60 分钟真实语音 soak；Round 3（SafetyPolicy 子进程能力、远端 HTTP、云 STT/TTS 许可、日志隐私）未开始
+
+---
+
 ## 2026-09-28 用户实机验收：RVC 与正式长期记忆通过
 
 - **RVC**：用户复现确认 Nahida 音色恢复正常。
@@ -8,7 +129,7 @@
 - **测试数据隔离**：未迁移 `tmp/memory-live-test.sqlite3` 中的银杏4729/桂花乌龙验收样本。
 - **隐私收口**：`.gitignore` 已忽略 `data/memory/` 与仓库根 `tmp/`，防止真实记忆库和诊断报告误提交；未删除本地数据。
 - **当前边界**：仅完成短时用户实测；30～60 分钟 RSS、线程、子进程、CPU/GPU 与延迟曲线仍未验证，不能据此宣称不存在长期泄漏或资源阶梯增长。
-- **仓库状态**：未提交、未推送；存储 Round 2/3 尚未开始。
+- **仓库状态**：Round 2 已在上方条目承接；Round 3 尚未开始。
 
 ---
 

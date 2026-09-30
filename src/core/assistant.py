@@ -10,19 +10,52 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
-from src.core.assembly import AssembledParts, assemble_default
+from src.core.assembly import (
+    AssembledParts,
+    assemble_default,
+    build_stt_engine,
+    build_tts_engine,
+    build_voice_engines,
+    _shutdown_engine,
+)
 from src.core.dispatch_outcome import DispatchOutcome, ReplyStage
 from src.core.handlers.llm_handler import LLMIntentHandler
+from src.core.perf_timing import SessionTimer
+from src.core.resource_coord import release_owned_ollama_model, run_coordinated_warmup
+from src.core.resource_settings import ResourceSettings, parse_resource_settings
 from src.core.router import IntentRouter
 from src.core.router_factory import build_intent_router
 from src.core.safety import SafetyPolicy
 from src.core.sentence_splitter import IncrementalSentenceSplitter
 from src.core.speech_queue import PlaybackStatus, TurnSpeechPlayer
+from src.core.startup_mode import StartupMode, normalize_startup_mode
 from src.llm.generate_result import GenerateResult, GenerateStatus
 from src.llm.stream_events import StreamEventKind
 from src.voice.recognition import RecognitionResult, RecognitionStatus
+
+
+@dataclass
+class VoiceStackLoadResult:
+    """首次进入语音时懒加载结果；失败为结构化报告，不抛裸异常。"""
+
+    ok: bool = False
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        lines = ["语音栈加载:"]
+        lines.append(f"  状态: {'通过' if self.ok else '未通过'}")
+        for err in self.errors:
+            lines.append(f"  [错误] {err}")
+        for warn in self.warnings:
+            lines.append(f"  [警告] {warn}")
+        return "\n".join(lines)
+
+
+# single-flight 等待者的总 deadline（秒）；超时返回结构化失败，不重置循环
+VOICE_LOAD_WAIT_SECONDS = 30.0
 
 
 @dataclass
@@ -56,12 +89,20 @@ class MikuAssistant:
         播报中退出会请求停止播放器并回收 RVC Worker；第三方阻塞音频后端仍只能尽力关闭。
     """
 
-    def __init__(self, config_path: Optional[str] = None, *, _parts: Optional[AssembledParts] = None):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        *,
+        startup_mode: object = None,
+        _parts: Optional[AssembledParts] = None,
+    ):
         """
         创建助手实例。
 
         Args:
             config_path: 可选配置路径；默认装配时使用。与 ``_parts`` 互斥于外部用法。
+            startup_mode: ``text`` / ``voice`` / ``interactive``；装配前可知。
+                ``None`` 时默认 ``interactive``（与 CLI 一致）。
             _parts: 内部/工厂绑定用；外部请使用 ``from_dependencies``。
 
         Raises:
@@ -72,7 +113,10 @@ class MikuAssistant:
             return
 
         try:
-            parts = assemble_default(config_path)
+            mode = normalize_startup_mode(
+                startup_mode, default="interactive"
+            )
+            parts = assemble_default(config_path, startup_mode=mode)
         except Exception as exc:
             logging.getLogger(__name__).error("模块初始化失败: %s", exc, exc_info=True)
             raise
@@ -125,6 +169,9 @@ class MikuAssistant:
             router=intent_router,
             logger=logger,
             memory_runtime=memory_runtime,
+            startup_mode="interactive",
+            resource_settings=None,
+            voice_autoload_enabled=False,
         )
         return cls(_parts=parts)
 
@@ -142,6 +189,16 @@ class MikuAssistant:
         self.file_cleaner = parts.file_cleaner
         self.router = parts.router
         self.memory_runtime = getattr(parts, "memory_runtime", None)
+        self.startup_mode: StartupMode = getattr(parts, "startup_mode", "interactive")
+        self.resource_settings: ResourceSettings = (
+            getattr(parts, "resource_settings", None)
+            or parse_resource_settings(parts.config)
+        )
+        self._voice_autoload_enabled = bool(
+            getattr(parts, "voice_autoload_enabled", False)
+        )
+        self._tts_engine_cls = getattr(parts, "tts_engine_cls", None)
+        self._stt_engine_cls = getattr(parts, "stt_engine_cls", None)
         if parts.logger is not None:
             self.logger = parts.logger
         else:
@@ -155,6 +212,393 @@ class MikuAssistant:
         self._turn_seq = 0
         self._active_turn: Optional[_GenerationTurn] = None
         self._turn_lock = threading.Lock()
+        self.session_timer = SessionTimer()
+        # 语音懒加载：lifecycle 标记 closing；loader mutex 做 single-flight（构造不持 lifecycle）
+        self._lifecycle_lock = threading.RLock()
+        self._voice_loader_lock = threading.Lock()
+        self._voice_load_cv = threading.Condition(self._voice_loader_lock)
+        self._voice_loading = False
+        self._owned_tts = False
+        self._owned_stt = False
+        self._tts_load_failed = False
+        self._tts_fail_notified = False
+
+    def _lifecycle_closed(self) -> bool:
+        return bool(self._shutting_down or self._non_memory_shutdown_done)
+
+    def _wake_voice_loaders(self) -> None:
+        """关闭开始后唤醒所有 loader 等待者；调用方不得持有 lifecycle lock。"""
+        with self._voice_loader_lock:
+            self._voice_load_cv.notify_all()
+
+    def _wait_while_voice_loading_locked(
+        self, *, label: str
+    ) -> Optional[VoiceStackLoadResult]:
+        """
+        在已持有 ``_voice_loader_lock`` 时等待 single-flight。
+
+        使用单一有限 deadline；超时或 closing 返回失败，否则返回 ``None`` 表示可继续。
+        """
+        deadline = time.monotonic() + VOICE_LOAD_WAIT_SECONDS
+        while self._voice_loading:
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    return VoiceStackLoadResult(
+                        ok=False, errors=[f"助手正在关闭，无法加载{label}"]
+                    )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return VoiceStackLoadResult(
+                    ok=False, errors=[f"语音加载等待超时（{label}）"]
+                )
+            self._voice_load_cv.wait(timeout=remaining)
+        return None
+
+    def _discard_unpublished_tts(self, tts: Any) -> None:
+        """
+        回收本轮未发布 TTS。
+
+        尚无正式 TTS 时本实例可能已预热全局 RVC，必须 ``stop_rvc=True``；
+        已有正式 TTS 时不得停其 Worker（``stop_rvc=False``）。
+        """
+        stop_rvc = self.tts_engine is None
+        _shutdown_engine(tts, stop_rvc=stop_rvc)
+
+    def ensure_tts_for_playback(self, *, allow_retry: bool = False) -> VoiceStackLoadResult:
+        """
+        交互/文本路径首次真正需要播报时懒加载 TTS（不必同时加载 STT）。
+
+        ``allow_retry=True`` 用于用户显式 ``tts`` 命令，可清除本会话自动失败封锁。
+        关闭开始后即使旧引擎仍绑定也返回结构化失败。
+        """
+        with self._lifecycle_lock:
+            if self._lifecycle_closed():
+                return VoiceStackLoadResult(
+                    ok=False, errors=["助手正在关闭，无法加载 TTS"]
+                )
+            if self.tts_engine is not None:
+                return VoiceStackLoadResult(ok=True)
+            if self._tts_load_failed and not allow_retry:
+                return VoiceStackLoadResult(
+                    ok=False,
+                    errors=["TTS 先前加载失败；请输入 tts 显式重试"],
+                )
+            if allow_retry:
+                self._tts_load_failed = False
+                self._tts_fail_notified = False
+            if not self._voice_autoload_enabled:
+                return VoiceStackLoadResult(
+                    ok=False,
+                    errors=[
+                        "TTS 未装配且注入路径禁止自动创建。"
+                        "请注入 tts_engine 或使用可懒加载的 startup_mode。"
+                    ],
+                )
+
+        with self._voice_loader_lock:
+            waited = self._wait_while_voice_loading_locked(label="TTS")
+            if waited is not None:
+                return waited
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    return VoiceStackLoadResult(
+                        ok=False, errors=["助手正在关闭，无法加载 TTS"]
+                    )
+                if self.tts_engine is not None:
+                    return VoiceStackLoadResult(ok=True)
+                if self._tts_load_failed and not allow_retry:
+                    return VoiceStackLoadResult(
+                        ok=False,
+                        errors=["TTS 先前加载失败；请输入 tts 显式重试"],
+                    )
+                if allow_retry:
+                    self._tts_load_failed = False
+                    self._tts_fail_notified = False
+            self._voice_loading = True
+
+        tts: Any = None
+        try:
+            tts_cls = self._tts_engine_cls
+            kwargs = {}
+            if tts_cls is not None:
+                kwargs["tts_engine_cls"] = tts_cls
+            tts = build_tts_engine(
+                self.config,
+                self.safety_policy,
+                warm_rvc_on_init=False,
+                **kwargs,
+            )
+            run_coordinated_warmup(
+                llm_client=self.llm_client,
+                tts_engine=tts,
+                settings=self.resource_settings,
+                log=self.logger,
+            )
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    self._discard_unpublished_tts(tts)
+                    tts = None
+                    return VoiceStackLoadResult(
+                        ok=False, errors=["助手正在关闭，已丢弃新建 TTS"]
+                    )
+                if self.tts_engine is not None:
+                    self._discard_unpublished_tts(tts)
+                    tts = None
+                    return VoiceStackLoadResult(ok=True)
+                self.tts_engine = tts
+                self._owned_tts = True
+                self._tts_load_failed = False
+                tts = None
+                self.logger.info(
+                    "TTS 按需懒加载完成 session=%s",
+                    self.session_timer.session_id,
+                )
+                return VoiceStackLoadResult(ok=True)
+        except (KeyboardInterrupt, SystemExit):
+            self._discard_unpublished_tts(tts)
+            raise
+        except Exception as exc:
+            self._discard_unpublished_tts(tts)
+            self._tts_load_failed = True
+            self.logger.error("TTS 懒加载失败: %s", exc, exc_info=True)
+            return VoiceStackLoadResult(
+                ok=False, errors=[f"TTS 初始化失败: {exc}"]
+            )
+        finally:
+            with self._voice_loader_lock:
+                self._voice_loading = False
+                self._voice_load_cv.notify_all()
+
+    def ensure_voice_stack(self) -> VoiceStackLoadResult:
+        """
+        确保 STT/TTS 已就绪；``text``/``interactive`` 首次进入语音时懒加载。
+
+        两者皆缺时在同一 single-flight 事务中构造并一次发布；已有 TTS 仅缺 STT
+        时只补 STT。关闭开始后即使旧对象仍绑定也返回失败。
+        """
+        with self._lifecycle_lock:
+            if self._lifecycle_closed():
+                return VoiceStackLoadResult(
+                    ok=False, errors=["助手正在关闭，无法加载语音栈"]
+                )
+            if self.stt_engine is not None and self.tts_engine is not None:
+                return VoiceStackLoadResult(ok=True)
+            need_tts = self.tts_engine is None
+            need_stt = self.stt_engine is None
+            if not need_tts and not need_stt:
+                return VoiceStackLoadResult(ok=True)
+            if not self._voice_autoload_enabled:
+                if self.stt_engine is not None and self.tts_engine is None:
+                    return VoiceStackLoadResult(
+                        ok=True,
+                        warnings=["TTS 引擎未初始化（识别预检可通过，播报将不可用）"],
+                    )
+                return VoiceStackLoadResult(
+                    ok=False,
+                    errors=[
+                        "语音栈未装配且注入路径禁止自动创建真实 TTS/STT。"
+                        "请使用 startup_mode=voice 装配，或注入引擎后再进入语音。"
+                    ],
+                )
+
+        if need_tts and not need_stt:
+            return self.ensure_tts_for_playback()
+
+        if need_stt and not need_tts:
+            return self._ensure_stt_only()
+
+        return self._ensure_voice_stack_both()
+
+    def _ensure_voice_stack_both(self) -> VoiceStackLoadResult:
+        """两者皆缺：局部构造 TTS+STT，成功后一次发布；失败回收本轮 TTS/RVC。"""
+        with self._lifecycle_lock:
+            if self._lifecycle_closed():
+                return VoiceStackLoadResult(
+                    ok=False, errors=["助手正在关闭，无法加载语音栈"]
+                )
+            if self.tts_engine is not None and self.stt_engine is not None:
+                return VoiceStackLoadResult(ok=True)
+            route_stt_only = (
+                self.tts_engine is not None and self.stt_engine is None
+            )
+            route_tts_only = (
+                self.stt_engine is not None and self.tts_engine is None
+            )
+            if not self._voice_autoload_enabled and self.tts_engine is None:
+                return VoiceStackLoadResult(
+                    ok=False, errors=["语音栈未装配且禁止自动创建"]
+                )
+        # 不得在持有 lifecycle 时进入窄路径（其内可能 wait loader）
+        if route_stt_only:
+            return self._ensure_stt_only()
+        if route_tts_only:
+            return self.ensure_tts_for_playback()
+
+        with self._voice_loader_lock:
+            waited = self._wait_while_voice_loading_locked(label="语音栈")
+            if waited is not None:
+                return waited
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    return VoiceStackLoadResult(
+                        ok=False, errors=["助手正在关闭，无法加载语音栈"]
+                    )
+                if self.tts_engine is not None and self.stt_engine is not None:
+                    return VoiceStackLoadResult(ok=True)
+                route_stt_only = (
+                    self.tts_engine is not None and self.stt_engine is None
+                )
+                route_tts_only = (
+                    self.stt_engine is not None and self.tts_engine is None
+                )
+            if route_stt_only or route_tts_only:
+                pass
+            else:
+                self._voice_loading = True
+
+        if route_stt_only:
+            return self._ensure_stt_only()
+        if route_tts_only:
+            return self.ensure_tts_for_playback()
+
+        tts: Any = None
+        stt: Any = None
+        try:
+            tts_cls = self._tts_engine_cls
+            stt_cls = self._stt_engine_cls
+            tts_kwargs: dict = {}
+            stt_kwargs: dict = {}
+            if tts_cls is not None:
+                tts_kwargs["tts_engine_cls"] = tts_cls
+            if stt_cls is not None:
+                stt_kwargs["stt_engine_cls"] = stt_cls
+            tts = build_tts_engine(
+                self.config,
+                self.safety_policy,
+                warm_rvc_on_init=False,
+                **tts_kwargs,
+            )
+            try:
+                stt = build_stt_engine(self.config, **stt_kwargs)
+            except Exception:
+                self._discard_unpublished_tts(tts)
+                tts = None
+                raise
+            run_coordinated_warmup(
+                llm_client=self.llm_client,
+                tts_engine=tts,
+                settings=self.resource_settings,
+                log=self.logger,
+            )
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    self._discard_unpublished_tts(tts)
+                    tts = None
+                    stt = None
+                    return VoiceStackLoadResult(
+                        ok=False, errors=["助手正在关闭，已丢弃新建语音栈"]
+                    )
+                if self.tts_engine is not None and self.stt_engine is not None:
+                    self._discard_unpublished_tts(tts)
+                    tts = None
+                    stt = None
+                    return VoiceStackLoadResult(ok=True)
+                if self.tts_engine is None:
+                    self.tts_engine = tts
+                    self._owned_tts = True
+                    self._tts_load_failed = False
+                    tts = None
+                else:
+                    self._discard_unpublished_tts(tts)
+                    tts = None
+                if self.stt_engine is None:
+                    self.stt_engine = stt
+                    self._owned_stt = True
+                    stt = None
+                else:
+                    stt = None
+                self.logger.info(
+                    "语音栈懒加载完成 startup_mode=%s session=%s",
+                    self.startup_mode,
+                    self.session_timer.session_id,
+                )
+                return VoiceStackLoadResult(ok=True)
+        except (KeyboardInterrupt, SystemExit):
+            self._discard_unpublished_tts(tts)
+            raise
+        except Exception as exc:
+            self._discard_unpublished_tts(tts)
+            self.logger.error("语音栈懒加载失败: %s", exc, exc_info=True)
+            return VoiceStackLoadResult(
+                ok=False, errors=[f"语音栈初始化失败: {exc}"]
+            )
+        finally:
+            with self._voice_loader_lock:
+                self._voice_loading = False
+                self._voice_load_cv.notify_all()
+
+    def _ensure_stt_only(self) -> VoiceStackLoadResult:
+        """仅构造并发布 STT；不触碰已有 TTS / RVC。"""
+        with self._lifecycle_lock:
+            if self._lifecycle_closed():
+                return VoiceStackLoadResult(
+                    ok=False, errors=["助手正在关闭，无法加载 STT"]
+                )
+            if self.stt_engine is not None:
+                return VoiceStackLoadResult(ok=True)
+            if not self._voice_autoload_enabled:
+                return VoiceStackLoadResult(
+                    ok=False, errors=["STT 未装配且禁止自动创建"]
+                )
+
+        with self._voice_loader_lock:
+            waited = self._wait_while_voice_loading_locked(label="STT")
+            if waited is not None:
+                return waited
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    return VoiceStackLoadResult(
+                        ok=False, errors=["助手正在关闭，无法加载 STT"]
+                    )
+                if self.stt_engine is not None:
+                    return VoiceStackLoadResult(ok=True)
+            self._voice_loading = True
+
+        stt: Any = None
+        try:
+            stt_cls = self._stt_engine_cls
+            kwargs = {}
+            if stt_cls is not None:
+                kwargs["stt_engine_cls"] = stt_cls
+            stt = build_stt_engine(self.config, **kwargs)
+            with self._lifecycle_lock:
+                if self._lifecycle_closed():
+                    stt = None
+                    return VoiceStackLoadResult(
+                        ok=False, errors=["助手正在关闭，已丢弃新建 STT"]
+                    )
+                if self.stt_engine is not None:
+                    stt = None
+                    return VoiceStackLoadResult(ok=True)
+                self.stt_engine = stt
+                self._owned_stt = True
+                stt = None
+                self.logger.info(
+                    "STT 按需懒加载完成 session=%s",
+                    self.session_timer.session_id,
+                )
+                return VoiceStackLoadResult(ok=True)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self.logger.error("STT 懒加载失败: %s", exc, exc_info=True)
+            return VoiceStackLoadResult(
+                ok=False, errors=[f"STT 初始化失败: {exc}"]
+            )
+        finally:
+            with self._voice_loader_lock:
+                self._voice_loading = False
+                self._voice_load_cv.notify_all()
 
     @staticmethod
     def check_mode_switch(text: str) -> Optional[str]:
@@ -211,13 +655,20 @@ class MikuAssistant:
         turn = self._begin_generation_turn(external_cancel=None)
         if turn is None:
             return "助手正在关闭"
-        outcome = self._dispatch_text(text)
-        if use_tts is None:
-            use_tts = self.config.get("assistant.auto_tts", True)
-        if self._turn_is_active(turn, None):
-            self._apply_outcome_side_effects(
-                outcome, use_tts=use_tts, use_legacy_thread=True, turn=turn
-            )
+        perf_turn = self.session_timer.new_turn_id()
+        with self.session_timer.measure(
+            "request",
+            turn_id=perf_turn,
+            logger=self.logger,
+            counts_as_request=True,
+        ):
+            outcome = self._dispatch_text(text)
+            if use_tts is None:
+                use_tts = self.config.get("assistant.auto_tts", True)
+            if self._turn_is_active(turn, None):
+                self._apply_outcome_side_effects(
+                    outcome, use_tts=use_tts, use_legacy_thread=True, turn=turn
+                )
         return outcome.text
 
     def process_text_input_streaming(
@@ -251,210 +702,237 @@ class MikuAssistant:
                 return DispatchOutcome.module_unavailable("助手正在关闭")
             return DispatchOutcome.cancelled()
 
-        route = self._route_streaming(text)
-        if not self._turn_is_active(turn, cancel_event):
-            return DispatchOutcome.cancelled()
-
-        if route[0] == "outcome":
-            outcome = route[1]
-            assert isinstance(outcome, DispatchOutcome)
+        perf_turn = self.session_timer.new_turn_id()
+        _perf_t0 = time.perf_counter()
+        try:
+            route = self._route_streaming(text)
             if not self._turn_is_active(turn, cancel_event):
                 return DispatchOutcome.cancelled()
-            # 系统/搜索处理器不是 LLM token 流，但全双工回声门控仍需在播报前
-            # 得到同一份展示文本；CLI 也因此保持统一的增量展示契约。
-            if on_delta and outcome.text:
-                on_delta(outcome.text)
+
+            if route[0] == "outcome":
+                outcome = route[1]
+                assert isinstance(outcome, DispatchOutcome)
                 if not self._turn_is_active(turn, cancel_event):
                     return DispatchOutcome.cancelled()
-            if wait_for_playback:
-                return self._speak_outcome_tracked(
-                    outcome,
-                    turn=turn,
-                    use_tts=use_tts,
-                    cancel_event=cancel_event,
-                    playback_timeout=playback_timeout,
+                # 系统/搜索处理器不是 LLM token 流，但全双工回声门控仍需在播报前
+                # 得到同一份展示文本；CLI 也因此保持统一的增量展示契约。
+                if on_delta and outcome.text:
+                    on_delta(outcome.text)
+                    if not self._turn_is_active(turn, cancel_event):
+                        return DispatchOutcome.cancelled()
+                if wait_for_playback:
+                    return self._speak_outcome_tracked(
+                        outcome,
+                        turn=turn,
+                        use_tts=use_tts,
+                        cancel_event=cancel_event,
+                        playback_timeout=playback_timeout,
+                    )
+                self._apply_outcome_side_effects(
+                    outcome, use_tts=use_tts, use_legacy_thread=True, turn=turn
                 )
-            self._apply_outcome_side_effects(
-                outcome, use_tts=use_tts, use_legacy_thread=True, turn=turn
+                return outcome
+
+            llm = self.llm_client
+            assert llm is not None
+            player = None
+            if use_tts:
+                tts_ready = self.ensure_tts_for_playback()
+                if not tts_ready.ok and not self._tts_fail_notified:
+                    self._tts_fail_notified = True
+                    self.logger.warning(
+                        "流式播报跳过：TTS 不可用 errors=%s", tts_ready.errors
+                    )
+            if use_tts and self.tts_engine:
+                # token 归属与播报 begin_turn 同一临界区；失去所有权则不得 begin_turn
+                player = self._claim_speech_for_turn(turn, cancel_event)
+            if not self._turn_is_active(turn, cancel_event):
+                self._release_own_speech(turn)
+                return DispatchOutcome.cancelled()
+
+            splitter = IncrementalSentenceSplitter(
+                max_buffer=int(self.config.get("assistant.stream_sentence_max_buffer", 500))
             )
-            return outcome
-
-        llm = self.llm_client
-        assert llm is not None
-        player = None
-        if use_tts and self.tts_engine:
-            # token 归属与播报 begin_turn 同一临界区；失去所有权则不得 begin_turn
-            player = self._claim_speech_for_turn(turn, cancel_event)
-        if not self._turn_is_active(turn, cancel_event):
-            self._release_own_speech(turn)
-            return DispatchOutcome.cancelled()
-
-        splitter = IncrementalSentenceSplitter(
-            max_buffer=int(self.config.get("assistant.stream_sentence_max_buffer", 500))
-        )
-        stream = llm.generate_stream(text)
-        stream_iter = iter(stream)
-        generation_started = time.perf_counter()
-        first_delta_logged = False
-        assembled_display: list = []
-        outcome = DispatchOutcome(
-            text="",
-            allow_tts=False,
-            allow_character=False,
-            stage=ReplyStage.GENERATION_FAILED,
-        )
-        aborted = False
-        generation_committed = False
-        speech_started = False
-        received_terminal = False
-
-        def _try_enqueue(sentence: str) -> bool:
-            """入队；仅在本轮确有受管理播放器且句子被接受时标记可能在播。"""
-            nonlocal speech_started
-            ok = self._enqueue_sentence(player, turn, sentence, cancel_event)
-            if (
-                ok
-                and player is not None
-                and bool(turn.speech_turn_id)
-                and sentence
-                and sentence.strip()
-            ):
-                speech_started = True
-            return ok
-
-        def _abort_own(message: str) -> DispatchOutcome:
-            nonlocal aborted
-            aborted = True
-            splitter.discard()
-            turn.cancel.set()
-            self._release_own_speech(turn)
-            return DispatchOutcome.cancelled(
-                message, safe_to_resume_listen=not speech_started
+            stream = llm.generate_stream(text)
+            stream_iter = iter(stream)
+            generation_started = time.perf_counter()
+            first_delta_logged = False
+            assembled_display: list = []
+            outcome = DispatchOutcome(
+                text="",
+                allow_tts=False,
+                allow_character=False,
+                stage=ReplyStage.GENERATION_FAILED,
             )
+            aborted = False
+            generation_committed = False
+            speech_started = False
+            received_terminal = False
 
-        def _consumer_failed_ours() -> bool:
-            return (
-                player is not None
-                and bool(turn.speech_turn_id)
-                and player.turn_id == turn.speech_turn_id
-                and player.consumer_failed
-            )
+            def _try_enqueue(sentence: str) -> bool:
+                """入队；仅在本轮确有受管理播放器且句子被接受时标记可能在播。"""
+                nonlocal speech_started
+                ok = self._enqueue_sentence(player, turn, sentence, cancel_event)
+                if (
+                    ok
+                    and player is not None
+                    and bool(turn.speech_turn_id)
+                    and sentence
+                    and sentence.strip()
+                ):
+                    speech_started = True
+                return ok
 
-        try:
-            while True:
-                # 主动 next 之前检查：取消后不得再拉取（避免客户端 _complete/commit）
-                if not self._turn_is_active(turn, cancel_event):
-                    outcome = _abort_own("本轮已取消")
-                    break
-                if _consumer_failed_ours():
-                    if generation_committed:
-                        self._release_own_speech(turn)
-                        outcome = DispatchOutcome.playback_failed(
-                            "".join(assembled_display)
-                        )
-                    else:
-                        outcome = _abort_own("播报消费者失败，已停止本轮生成")
-                    break
+            def _abort_own(message: str) -> DispatchOutcome:
+                nonlocal aborted
+                aborted = True
+                splitter.discard()
+                turn.cancel.set()
+                self._release_own_speech(turn)
+                return DispatchOutcome.cancelled(
+                    message, safe_to_resume_listen=not speech_started
+                )
 
-                try:
-                    event = next(stream_iter)
-                except StopIteration:
-                    break
+            def _consumer_failed_ours() -> bool:
+                return (
+                    player is not None
+                    and bool(turn.speech_turn_id)
+                    and player.turn_id == turn.speech_turn_id
+                    and player.consumer_failed
+                )
 
-                if event.kind is StreamEventKind.TEXT_DELTA:
-                    delta = event.delta or ""
-                    if delta and not first_delta_logged:
-                        first_delta_logged = True
-                        self.logger.info(
-                            "[对话计时] Ollama 首段: %.0f ms",
-                            (time.perf_counter() - generation_started) * 1000,
-                        )
-                    assembled_display.append(delta)
-                    if on_delta and self._turn_is_active(turn, cancel_event):
-                        on_delta(delta)
-                    # 回调后立即再检；不得继续切句入队或拉取下一事件
+            try:
+                while True:
+                    # 主动 next 之前检查：取消后不得再拉取（避免客户端 _complete/commit）
                     if not self._turn_is_active(turn, cancel_event):
                         outcome = _abort_own("本轮已取消")
                         break
                     if _consumer_failed_ours():
-                        outcome = _abort_own("播报消费者失败，已停止本轮生成")
-                        break
-                    for sentence in splitter.push(delta):
-                        if not _try_enqueue(sentence):
-                            outcome = _abort_own("播报入队失败或已取消，本轮终止")
-                            break
-                    if aborted:
-                        break
-
-                elif event.kind is StreamEventKind.COMPLETED:
-                    received_terminal = True
-                    self.logger.info(
-                        "[对话计时] Ollama 生成完成: %.0f ms",
-                        (time.perf_counter() - generation_started) * 1000,
-                    )
-                    # 终结事件：客户端可能已在产出 COMPLETED 时 commit；立即处理并结束
-                    full = event.text or "".join(assembled_display)
-                    generation_ok = (
-                        event.status is GenerateStatus.SUCCESS and bool(full)
-                    )
-                    if generation_ok:
-                        generation_committed = True
-
-                    playback_failed = False
-                    for sentence in splitter.finish():
-                        if not _try_enqueue(sentence):
-                            playback_failed = True
-                            break
-
-                    if playback_failed or _consumer_failed_ours():
-                        self._release_own_speech(turn)
                         if generation_committed:
-                            outcome = DispatchOutcome.playback_failed(full)
+                            self._release_own_speech(turn)
+                            outcome = DispatchOutcome.playback_failed(
+                                "".join(assembled_display)
+                            )
                         else:
-                            outcome = _abort_own("播报入队失败或已取消，本轮终止")
+                            outcome = _abort_own("播报消费者失败，已停止本轮生成")
                         break
 
-                    if not self._turn_is_active(turn, cancel_event):
-                        self._release_own_speech(turn)
-                        if generation_committed:
-                            outcome = DispatchOutcome.playback_failed(full)
-                        else:
+                    try:
+                        event = next(stream_iter)
+                    except StopIteration:
+                        break
+
+                    if event.kind is StreamEventKind.TEXT_DELTA:
+                        delta = event.delta or ""
+                        if delta and not first_delta_logged:
+                            first_delta_logged = True
+                            self.logger.info(
+                                "[对话计时] Ollama 首段: %.0f ms",
+                                (time.perf_counter() - generation_started) * 1000,
+                            )
+                        assembled_display.append(delta)
+                        if on_delta and self._turn_is_active(turn, cancel_event):
+                            on_delta(delta)
+                        # 回调后立即再检；不得继续切句入队或拉取下一事件
+                        if not self._turn_is_active(turn, cancel_event):
                             outcome = _abort_own("本轮已取消")
+                            break
+                        if _consumer_failed_ours():
+                            outcome = _abort_own("播报消费者失败，已停止本轮生成")
+                            break
+                        for sentence in splitter.push(delta):
+                            if not _try_enqueue(sentence):
+                                outcome = _abort_own("播报入队失败或已取消，本轮终止")
+                                break
+                        if aborted:
+                            break
+
+                    elif event.kind is StreamEventKind.COMPLETED:
+                        received_terminal = True
+                        self.logger.info(
+                            "[对话计时] Ollama 生成完成: %.0f ms",
+                            (time.perf_counter() - generation_started) * 1000,
+                        )
+                        # 终结事件：客户端可能已在产出 COMPLETED 时 commit；立即处理并结束
+                        full = event.text or "".join(assembled_display)
+                        generation_ok = (
+                            event.status is GenerateStatus.SUCCESS and bool(full)
+                        )
+                        if generation_ok:
+                            generation_committed = True
+
+                        playback_failed = False
+                        for sentence in splitter.finish():
+                            if not _try_enqueue(sentence):
+                                playback_failed = True
+                                break
+
+                        if playback_failed or _consumer_failed_ours():
+                            self._release_own_speech(turn)
+                            if generation_committed:
+                                outcome = DispatchOutcome.playback_failed(full)
+                            else:
+                                outcome = _abort_own("播报入队失败或已取消，本轮终止")
+                            break
+
+                        if not self._turn_is_active(turn, cancel_event):
+                            self._release_own_speech(turn)
+                            if generation_committed:
+                                outcome = DispatchOutcome.playback_failed(full)
+                            else:
+                                outcome = _abort_own("本轮已取消")
+                            break
+
+                        if generation_ok:
+                            outcome = DispatchOutcome(
+                                text=full,
+                                allow_tts=True,
+                                allow_character=True,
+                                stage=ReplyStage.OK,
+                            )
+                            if (
+                                self._turn_is_active(turn, cancel_event)
+                                and self.character_interface
+                                and self.character_interface._initialized
+                            ):
+                                self.character_interface.send_message(full)
+                        else:
+                            splitter.discard()
+                            self._release_own_speech(turn)
+                            outcome = DispatchOutcome(
+                                text="",
+                                allow_tts=False,
+                                allow_character=False,
+                                stage=ReplyStage.GENERATION_FAILED,
+                                safe_to_resume_listen=not speech_started,
+                            )
                         break
 
-                    if generation_ok:
-                        outcome = DispatchOutcome(
-                            text=full,
-                            allow_tts=True,
-                            allow_character=True,
-                            stage=ReplyStage.OK,
-                        )
-                        if (
-                            self._turn_is_active(turn, cancel_event)
-                            and self.character_interface
-                            and self.character_interface._initialized
-                        ):
-                            self.character_interface.send_message(full)
-                    else:
+                    elif event.kind is StreamEventKind.FAILED:
+                        received_terminal = True
                         splitter.discard()
+                        turn.cancel.set()
                         self._release_own_speech(turn)
+                        detail = event.error_detail or "生成失败"
+                        status = event.status or GenerateStatus.RESPONSE_ERROR
+                        legacy = GenerateResult.failure(status, detail).to_legacy_string()
                         outcome = DispatchOutcome(
-                            text="",
+                            text=legacy,
                             allow_tts=False,
                             allow_character=False,
                             stage=ReplyStage.GENERATION_FAILED,
                             safe_to_resume_listen=not speech_started,
                         )
-                    break
+                        break
 
-                elif event.kind is StreamEventKind.FAILED:
-                    received_terminal = True
+                # 无 COMPLETED/FAILED 的正常耗尽：结构化生成失败（非成功）
+                if not aborted and not received_terminal:
                     splitter.discard()
                     turn.cancel.set()
                     self._release_own_speech(turn)
-                    detail = event.error_detail or "生成失败"
-                    status = event.status or GenerateStatus.RESPONSE_ERROR
-                    legacy = GenerateResult.failure(status, detail).to_legacy_string()
+                    legacy = GenerateResult.failure(
+                        GenerateStatus.RESPONSE_ERROR, "流未正常结束"
+                    ).to_legacy_string()
                     outcome = DispatchOutcome(
                         text=legacy,
                         allow_tts=False,
@@ -462,68 +940,59 @@ class MikuAssistant:
                         stage=ReplyStage.GENERATION_FAILED,
                         safe_to_resume_listen=not speech_started,
                     )
-                    break
-
-            # 无 COMPLETED/FAILED 的正常耗尽：结构化生成失败（非成功）
-            if not aborted and not received_terminal:
+            except Exception as exc:
+                # 普通异常：CAS 释放后转为窄契约结果；不得证明静默时不可恢复监听
                 splitter.discard()
                 turn.cancel.set()
                 self._release_own_speech(turn)
-                legacy = GenerateResult.failure(
-                    GenerateStatus.RESPONSE_ERROR, "流未正常结束"
-                ).to_legacy_string()
                 outcome = DispatchOutcome(
-                    text=legacy,
+                    text=f"错误: {exc}",
                     allow_tts=False,
                     allow_character=False,
                     stage=ReplyStage.GENERATION_FAILED,
                     safe_to_resume_listen=not speech_started,
                 )
-        except Exception as exc:
-            # 普通异常：CAS 释放后转为窄契约结果；不得证明静默时不可恢复监听
-            splitter.discard()
-            turn.cancel.set()
-            self._release_own_speech(turn)
-            outcome = DispatchOutcome(
-                text=f"错误: {exc}",
-                allow_tts=False,
-                allow_character=False,
-                stage=ReplyStage.GENERATION_FAILED,
-                safe_to_resume_listen=not speech_started,
-            )
-        except BaseException:
-            splitter.discard()
-            turn.cancel.set()
-            self._release_own_speech(turn)
-            raise
-        finally:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    self.logger.debug("关闭生成流时忽略异常", exc_info=True)
+            except BaseException:
+                splitter.discard()
+                turn.cancel.set()
+                self._release_own_speech(turn)
+                raise
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        self.logger.debug("关闭生成流时忽略异常", exc_info=True)
 
-        if wait_for_playback:
-            if outcome.stage is ReplyStage.PLAYBACK_FAILED:
-                if player is not None and turn.speech_turn_id:
-                    player.mark_production_finished(turn.speech_turn_id)
-            elif outcome.stage in (
-                ReplyStage.CANCELLED,
-                ReplyStage.GENERATION_FAILED,
-            ):
-                # 已在 abort/fail/无终结耗尽路径 CAS 释放；兜底清理无播报归属
-                if player is not None and turn.speech_turn_id and not speech_started:
-                    self._release_own_speech(turn)
-            else:
-                outcome = self._await_stream_playback(
-                    outcome,
-                    turn=turn,
-                    player=player,
-                    cancel_event=cancel_event,
-                    playback_timeout=playback_timeout,
-                )
-        return outcome
+            if wait_for_playback:
+                if outcome.stage is ReplyStage.PLAYBACK_FAILED:
+                    if player is not None and turn.speech_turn_id:
+                        player.mark_production_finished(turn.speech_turn_id)
+                elif outcome.stage in (
+                    ReplyStage.CANCELLED,
+                    ReplyStage.GENERATION_FAILED,
+                ):
+                    # 已在 abort/fail/无终结耗尽路径 CAS 释放；兜底清理无播报归属
+                    if player is not None and turn.speech_turn_id and not speech_started:
+                        self._release_own_speech(turn)
+                else:
+                    outcome = self._await_stream_playback(
+                        outcome,
+                        turn=turn,
+                        player=player,
+                        cancel_event=cancel_event,
+                        playback_timeout=playback_timeout,
+                    )
+            return outcome
+        finally:
+            self.session_timer.record_stage(
+                "request_stream",
+                (time.perf_counter() - _perf_t0) * 1000.0,
+                turn_id=perf_turn,
+                logger=self.logger,
+                counts_as_request=True,
+            )
 
     def _begin_generation_turn(
         self, *, external_cancel: Optional[threading.Event]
@@ -677,20 +1146,28 @@ class MikuAssistant:
         if turn is not None and turn.cancel.is_set():
             return
         response = outcome.text
-        if use_tts and outcome.allow_tts and self.tts_engine:
-            tts_text = self.strip_assistant_prefix(response)
-            if use_legacy_thread:
-                try:
-                    threading.Thread(
-                        target=self.tts_engine.speak,
-                        args=(tts_text,),
-                        daemon=True,
-                    ).start()
-                except Exception as exc:
-                    self.logger.error("启动音频播放线程失败: %s", exc)
+        if use_tts and outcome.allow_tts:
+            if self.tts_engine is None and self._voice_autoload_enabled:
+                load = self.ensure_tts_for_playback()
+                if not load.ok and not self._tts_fail_notified:
+                    self._tts_fail_notified = True
+                    self.logger.warning(
+                        "自动播报跳过：TTS 不可用 errors=%s", load.errors
+                    )
+            if self.tts_engine:
+                tts_text = self.strip_assistant_prefix(response)
+                if use_legacy_thread:
+                    try:
+                        threading.Thread(
+                            target=self.tts_engine.speak,
+                            args=(tts_text,),
+                            daemon=True,
+                        ).start()
+                    except Exception as exc:
+                        self.logger.error("启动音频播放线程失败: %s", exc)
+                        self.tts_engine.speak(tts_text)
+                else:
                     self.tts_engine.speak(tts_text)
-            else:
-                self.tts_engine.speak(tts_text)
 
         if (
             outcome.allow_character
@@ -717,6 +1194,11 @@ class MikuAssistant:
         ):
             self.character_interface.send_message(outcome.text)
 
+        if use_tts and outcome.allow_tts and outcome.text and self._turn_is_active(
+            turn, cancel_event
+        ):
+            if self.tts_engine is None and self._voice_autoload_enabled:
+                self.ensure_tts_for_playback()
         if not (
             use_tts
             and outcome.allow_tts
@@ -959,7 +1441,10 @@ class MikuAssistant:
             return
 
         self.logger.info("正在关闭助手...")
-        self._shutting_down = True
+        with self._lifecycle_lock:
+            self._shutting_down = True
+        # 先释放 lifecycle，再唤醒 loader 等待者（不得在持 lifecycle 时等 loader）
+        self._wake_voice_loaders()
         with self._turn_lock:
             if self._active_turn is not None:
                 self._active_turn.cancel.set()
@@ -1014,6 +1499,13 @@ class MikuAssistant:
             return
 
         memory_ok = _close_memory()
+
+        # 仅释放本程序 keep_alive 驻留；不停止用户的 Ollama 服务
+        release_owned_ollama_model(
+            self.llm_client,
+            settings=self.resource_settings,
+            log=self.logger,
+        )
 
         if self.tts_engine:
             _run_step("tts_engine", "shutdown", self.tts_engine.shutdown)

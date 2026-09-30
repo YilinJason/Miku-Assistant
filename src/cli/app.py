@@ -60,7 +60,7 @@ def main() -> None:
 
     assistant = None
     try:
-        assistant = MikuAssistant(config_path=args.config)
+        assistant = MikuAssistant(config_path=args.config, startup_mode=args.mode)
         if args.auto_tts:
             assistant.config.set("assistant.auto_tts", True)
         if args.stream:

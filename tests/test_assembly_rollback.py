@@ -109,6 +109,7 @@ class AssemblyRollbackTests(unittest.TestCase):
     def _common_kwargs(self, **overrides: Any) -> dict:
         cfg = overrides.pop("config", _base_config())
         kwargs = {
+            "startup_mode": "voice",
             "config_loader": lambda path: cfg,
             "logging_setup": lambda c: None,
             "dir_preparer": lambda: None,

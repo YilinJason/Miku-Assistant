@@ -177,6 +177,21 @@ class Config:
                     'batch_limit': 64,
                 },
             },
+            'resource': {
+                'profile': 'balanced',
+                'ollama': {
+                    'warmup_on_start': True,
+                    'unload_on_exit': False,
+                },
+                'rvc': {
+                    'warmup_on_voice_start': True,
+                },
+                'warmup': {
+                    'serialize_gpu': True,
+                    'order': 'ollama_then_rvc',
+                    'timeout': 120.0,
+                },
+            },
         }
 
     def get(self, key: str, default: Any = None) -> Any:

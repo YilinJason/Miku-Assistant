@@ -585,6 +585,7 @@ class DefaultAssemblyWiringTests(unittest.TestCase):
 
         parts = assemble_default(
             "cfg.yaml",
+            startup_mode="voice",
             config_loader=load_config,
             logging_setup=logging_setup,
             dir_preparer=prepare_dirs,
@@ -635,10 +636,16 @@ class DefaultAssemblyWiringTests(unittest.TestCase):
         parts.file_cleaner = None
         parts.router = FakeRouter("from-default")
         parts.logger = None
+        parts.memory_runtime = None
+        parts.startup_mode = "interactive"
+        parts.resource_settings = None
+        parts.voice_autoload_enabled = False
+        parts.tts_engine_cls = None
+        parts.stt_engine_cls = None
 
         with patch("src.core.assistant.assemble_default", return_value=parts) as assemble:
             assistant = MikuAssistant("path.yaml")
-            assemble.assert_called_once_with("path.yaml")
+            assemble.assert_called_once_with("path.yaml", startup_mode="interactive")
             self.assertEqual(
                 assistant.process_text_input("n", use_tts=False), "from-default"
             )

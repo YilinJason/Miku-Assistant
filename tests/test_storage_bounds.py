@@ -706,6 +706,7 @@ class HistoryConfigWiringTests(unittest.TestCase):
         )
         parts = assemble_default(
             config_path="unused",
+            startup_mode="text",
             config_loader=lambda _p: cfg,
             logging_setup=lambda _c: None,
             dir_preparer=lambda: None,

@@ -80,6 +80,14 @@ class OllamaClient:
         self._warmup_thread: Optional[threading.Thread] = None
         self._warmup_ok: Optional[bool] = None
         self._warmup_wait_timeout = max(1.0, float(timeout)) + 5.0
+        self._model_touch_succeeded = False
+
+    def _mark_model_touched(self) -> None:
+        """记录本客户端曾成功触达模型（预热或正式请求）。"""
+        self._model_touch_succeeded = True
+
+    def model_touch_succeeded(self) -> bool:
+        return bool(self._model_touch_succeeded)
 
     def _apply_runtime_options(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """把不改变对话内容的 Ollama 运行参数统一加入请求。"""
@@ -120,6 +128,7 @@ class OllamaClient:
             data = response.json()
             if not isinstance(data, dict) or data.get("done") is not True:
                 raise ValueError("Ollama 预热响应缺少 done=true")
+            self._mark_model_touched()
             self._log_response_metrics(data, stage="预热")
             self.logger.info(
                 "[Ollama计时] 预热请求完成: %.0f ms",
@@ -163,6 +172,52 @@ class OllamaClient:
                 self._warmup_ok = False
                 raise
             return True
+
+    def wait_for_warmup(self, *, timeout: Optional[float] = None) -> bool:
+        """有界等待后台预热结束；供资源协调器串行 RVC 前调用。"""
+        wait_timeout = (
+            self._warmup_wait_timeout if timeout is None else max(1.0, float(timeout))
+        )
+        thread = self._warmup_thread
+        if thread is None and not self._warmup_done.is_set():
+            return True
+        if self._warmup_done.is_set():
+            return True
+        return bool(self._warmup_done.wait(timeout=wait_timeout))
+
+    def release_owned_model(self) -> bool:
+        """
+        Best-effort：对共享 Ollama 中的指定模型发送 ``keep_alive=0``。
+
+        可能影响同名模型的其他本地客户端；不停止 Ollama 服务。
+        若本客户端从未成功触达模型，则不发 HTTP。
+        """
+        if not self._model_touch_succeeded:
+            self.logger.info(
+                "跳过 keep_alive=0：本客户端未曾成功触达模型"
+            )
+            return False
+        url = f"{self.base_url}/api/chat"
+        payload = {
+            "model": self.model,
+            "messages": [],
+            "stream": False,
+            "keep_alive": 0,
+        }
+        started = time.perf_counter()
+        try:
+            post = getattr(self, "_http_post", None) or requests.post
+            response = post(url, json=payload, timeout=min(30.0, float(self.timeout)))
+            response.raise_for_status()
+            self.logger.info(
+                "[Ollama计时] best-effort keep_alive=0: %.0f ms "
+                "（共享模型；可能影响其他客户端；未停止服务）",
+                (time.perf_counter() - started) * 1000,
+            )
+            return True
+        except Exception as exc:
+            self.logger.warning("keep_alive=0 卸载请求失败: %s", exc)
+            return False
 
     def _wait_for_warmup(self) -> None:
         """正式请求与后台预热重叠时等待同一次模型加载，避免重复争用资源。"""
@@ -235,6 +290,7 @@ class OllamaClient:
         try:
             response = requests.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
+            self._mark_model_touched()
 
             if stream:
                 text = self._aggregate_stream(response)
@@ -343,6 +399,7 @@ class OllamaClient:
                     url, json=payload, timeout=self.timeout, stream=True
                 )
                 response.raise_for_status()
+                self._mark_model_touched()
             except requests.exceptions.Timeout as exc:
                 yield _fail(
                     GenerateStatus.TIMEOUT,

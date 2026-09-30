@@ -4,7 +4,7 @@
 > 章节区分：**历史发现**、**路由可测化（第一小步）**、**助手装配分离（第二小步）**。  
 > 依据：`AGENTS.md`、`skills/safe-refactoring`、`skills/architecture-contracts`、`skills/engineering-quality`。
 
-**范围说明**：默认启动仍会创建真实引擎（副作用未从生产路径消除）；离线测试通过 `from_dependencies` 绕过。审计起点尚未解决播报取消或端到端流式；后续 6.9–6.10 已渐进补齐应用层取消、增量显示/分句播报与语音轮流说话契约，底层音频硬打断仍未实现。
+**范围说明**：CLI 按 `--mode` 在装配前选择启动模式（Round 2）：`text`/`interactive` 不构造语音栈，`voice` 可同步构造；离线测试通过 `from_dependencies` 绕过。审计起点尚未解决播报取消或端到端流式；后续 6.9–6.10 已渐进补齐应用层取消、增量显示/分句播报与语音轮流说话契约，底层音频硬打断仍未实现。
 
 ---
 
@@ -16,11 +16,12 @@
 main.py
   └── src/cli/app.py
         └── src/core/assistant.py     # 业务编排
-              ├── 默认：assemble_default（config/日志/目录/引擎/清理器）
-              ├── 测试：from_dependencies（仅绑定传入组件）
+              ├── 默认：assemble_default(startup_mode=text|voice|interactive)
+              ├── 测试：from_dependencies（仅绑定传入组件；禁止自动建真实 TTS/STT）
               ├── IntentRouter ← build_intent_router
               │     → System → Search → LLM handlers
-              ├── OllamaClient / TTSEngine / STTEngine / …
+              ├── OllamaClient；TTS/STT 按模式装配或 ensure_voice_stack 懒加载
+              ├── resource.* 串行预热 / 可选 unload_on_exit（不停 Ollama 服务）
               └── FileCleaner（默认路径启动 Timer）
 ```
 

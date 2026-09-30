@@ -42,7 +42,7 @@ class VoicePreflightReport:
 
 def check_voice_preflight(assistant: MikuAssistant) -> VoicePreflightReport:
     """
-    执行完整语音预检：STT → 麦克风 → Ollama 连接与模型。
+    执行完整语音预检：语音栈懒加载 → STT → 麦克风 → Ollama 连接与模型。
 
     Args:
         assistant: 已初始化的助手实例。
@@ -51,6 +51,13 @@ def check_voice_preflight(assistant: MikuAssistant) -> VoicePreflightReport:
         ``VoicePreflightReport``；任一硬性检查失败时 ``ok=False`` 并附带 ``errors``。
     """
     report = VoicePreflightReport()
+
+    load = assistant.ensure_voice_stack()
+    if not load.ok:
+        report.errors.extend(load.errors)
+        report.warnings.extend(load.warnings)
+        return report
+    report.warnings.extend(load.warnings)
 
     if not assistant.stt_engine or not assistant.stt_engine.is_ready():
         report.errors.append("语音识别(STT)未初始化，请安装 SpeechRecognition 和 PyAudio")
