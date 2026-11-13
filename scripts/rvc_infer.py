@@ -29,7 +29,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.voice.rvc.vc_params import build_vc_kwargs
+
+def _early_join_owned_job() -> None:
+    from src.core.owned_worker_job import worker_entry_join_owned_job
+
+    worker_entry_join_owned_job()
 
 
 def _patch_torch_load_for_fairseq() -> None:
@@ -55,6 +59,9 @@ def main() -> int:
     Returns:
         0 表示成功；1 表示参数、依赖、推理或写文件失败。
     """
+    _early_join_owned_job()
+    from src.voice.rvc.vc_params import build_vc_kwargs
+
     parser = argparse.ArgumentParser(description="RVC voice conversion")
     parser.add_argument(
         "--input",
@@ -97,13 +104,13 @@ def main() -> int:
         "--protect",
         type=float,
         default=0.5,
-        help="protect 参数，越高越保护清辅音、减轻伪影",
+        help="protect 参数：0.5 关闭保护，更小更保护清辅音/气声",
     )
     parser.add_argument(
         "--filter-radius",
         type=int,
         default=3,
-        help="中值滤波半径",
+        help="Harvest f0 中值滤波半径（rmvpe 不使用）",
     )
     parser.add_argument(
         "--rms-mix-rate",
@@ -125,12 +132,22 @@ def main() -> int:
         print(f"Input not found: {args.input}", file=sys.stderr)
         return 1
 
+    from src.voice.rvc.local_assets import RvcLocalAssetsError, ensure_rvc_python_local_assets
+
+    try:
+        assets = ensure_rvc_python_local_assets()
+    except RvcLocalAssetsError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    from src.voice.rvc.cpu_budget import apply_rvc_torch_thread_budget
+
+    apply_rvc_torch_thread_budget()
     _patch_torch_load_for_fairseq()
 
     try:
         from rvc_python.configs.config import Config
         from rvc_python.modules.vc.modules import VC
-        from rvc_python.download_model import download_rvc_models
         from scipy.io import wavfile
     except ImportError as exc:
         print(f"Missing rvc_python: {exc}", file=sys.stderr)
@@ -145,8 +162,7 @@ def main() -> int:
         except ImportError:
             device = "cpu"
 
-    lib_dir = os.path.dirname(os.path.abspath(__import__("rvc_python").__file__))
-    download_rvc_models(lib_dir)
+    lib_dir = assets.lib_dir
 
     config = Config(lib_dir, device)
     vc = VC(lib_dir, config)

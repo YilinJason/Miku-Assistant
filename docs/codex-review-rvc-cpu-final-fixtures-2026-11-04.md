@@ -1,0 +1,8 @@
+# RVC CPU 源码通过，最后fixture窄修
+
+Root source差异与独立6/6、新仓库13/13、owned/security66/66、RVC生命周期45/45均PASS，WAV826零差。生产冻结。测试本身仍两处应收口：
+
+1. test_rvc_worker_lifecycle.py test_queued_speak_from_interrupted_turn_cannot_clear_new_interrupt 的worker.start和snapshot_seen.wait断言在try前；一旦assert失败，持有的_speak_lock不会释放，非daemon worker永不退出。把启动和wait也包入finally责任；无论wait/start/interrupt哪个失败，都只在已持锁时release，然后已实际start线程join，确认dead，主线程重抛worker错误。patch应活到实际join，不能interrupt fake提前退出让lateworker触碰真实globalRVC。不要因fixture问题改源或业务断言。
+2. tests/test_security_round3a.py test_voice_builders_share_same_policy_and_temp_manager 虽已patch AudioPlayer但仍会真实_init_pyttsx3（本机未装所以打印warning，不能依赖未装确保离线）。在构造前patch TTSEngine._initialize_engine（或_init_pyttsx3），保持所有policyshare断言；finally在patch内engine.shutdown(stop_rvc=False)，确认aggregate.complete，再mgr.shutdown complete/owned0/workerquiet，然后退出patch/TemporaryDirectory。不要全局stop RVC或开设备。其它构造fixtures若同类仅此范围核实。
+
+本轮仍不运行测试，局部compile/diffcheck+handoff STOP由Root跑最后两模块。ADR先恢复Proposed（当前写Accepted但Root未批准），真实设备CPU/延迟未证明，禁止美化结论。未完成旧b记录保留，不触Rootprobe/监督器和其它性能项目。

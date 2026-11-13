@@ -144,6 +144,9 @@ class ExtractionResult:
     items: tuple[ExtractedMemory, ...]
     telemetry: OllamaChatTelemetry
     skipped_locally: bool = False
+    local_candidates: int = 0
+    selected: int = 0
+    skip_reason: str = ""
 
 
 def parse_ollama_chat_telemetry(raw: Any) -> OllamaChatTelemetry:
@@ -190,6 +193,9 @@ class RequestsOllamaChatTransport:
         timeout: float = 60.0,
         session: Optional[requests.Session] = None,
         logger: Optional[logging.Logger] = None,
+        safety_policy: Optional[Any] = None,
+        sealed_endpoint: Optional[Any] = None,
+        model_memory_guard: Optional[Any] = None,
     ) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise MemoryValidationError("base_url must be non-empty str")
@@ -200,41 +206,116 @@ class RequestsOllamaChatTransport:
             raise MemoryValidationError("timeout must be finite")
         if timeout_f <= 0:
             raise MemoryValidationError("timeout must be positive")
-        self._base_url = base_url.rstrip("/")
+        from src.core.network_endpoint import (
+            SealedModelEndpoint,
+            authorize_model_endpoint,
+            reseal_model_endpoint,
+        )
+
+        if sealed_endpoint is not None:
+            if not isinstance(sealed_endpoint, SealedModelEndpoint):
+                raise MemoryValidationError("sealed_endpoint must be SealedModelEndpoint")
+            try:
+                self._endpoint = reseal_model_endpoint(
+                    safety_policy,
+                    sealed_endpoint,
+                    context="memory_extractor_transport",
+                )
+            except (ValueError, PermissionError) as exc:
+                raise MemoryValidationError(str(exc)) from exc
+        else:
+            try:
+                self._endpoint = authorize_model_endpoint(
+                    safety_policy, base_url, context="memory_extractor_transport"
+                )
+            except (ValueError, PermissionError) as exc:
+                raise MemoryValidationError(str(exc)) from exc
+        self._base_url = self._endpoint.base_url
         self._timeout = timeout_f
         self._session = session
         self._logger = logger or logging.getLogger(__name__)
+        self.safety_policy = safety_policy
+        self._model_memory_guard = model_memory_guard
 
     def post_chat(self, payload: dict[str, Any]) -> Any:
-        url = f"{self._base_url}/api/chat"
+        from src.core.model_memory_admission import (
+            ModelMemoryAdmissionError,
+            payload_exempt_from_model_admission,
+        )
+
+        guard = self._model_memory_guard
+        if guard is not None and not payload_exempt_from_model_admission(payload):
+            model = payload.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise MemoryExtractionTransportError(
+                    "memory extractor missing model name",
+                    error_kind="resource",
+                )
+            try:
+                guard.require_model_post(
+                    model,
+                    call_timeout=self._timeout,
+                    sealed_endpoint=self._endpoint,
+                )
+            except ModelMemoryAdmissionError as exc:
+                self._logger.warning(
+                    "memory extractor resource admission reason=%s", exc.reason
+                )
+                raise MemoryExtractionTransportError(
+                    exc.user_message, error_kind="resource"
+                ) from exc
+        from src.core.network_endpoint import (
+            best_effort_close_response,
+            enforce_no_redirect,
+        )
+
+        url = self._endpoint.api_url("/api/chat")
         sess = self._session if self._session is not None else requests
+        response: Any = None
         try:
-            response = sess.post(url, json=payload, timeout=self._timeout)
-        except requests.Timeout as exc:
-            self._logger.error("memory extractor transport timeout err=%s", type(exc).__name__)
-            raise MemoryExtractionTransportError(
-                "ollama chat timed out", error_kind="timeout"
-            ) from exc
-        except requests.RequestException as exc:
-            self._logger.error(
-                "memory extractor transport failed err=%s", type(exc).__name__
-            )
-            raise MemoryExtractionTransportError(
-                "ollama chat transport failed", error_kind="connection"
-            ) from exc
-        if response.status_code >= 400:
-            self._logger.error("memory extractor http status=%s", response.status_code)
-            raise MemoryExtractionTransportError(
-                f"ollama chat http {response.status_code}",
-                error_kind="http",
-            )
-        try:
-            return response.json()
-        except ValueError as exc:
-            self._logger.error("memory extractor response json err=%s", type(exc).__name__)
-            raise MemoryExtractionResponseError(
-                "ollama chat response is not json", error_kind="json"
-            ) from exc
+            try:
+                response = sess.post(
+                    url, json=payload, timeout=self._timeout, allow_redirects=False
+                )
+            except requests.Timeout as exc:
+                self._logger.error("memory extractor transport timeout err=%s", type(exc).__name__)
+                raise MemoryExtractionTransportError(
+                    "ollama chat timed out", error_kind="timeout"
+                ) from exc
+            except requests.RequestException as exc:
+                self._logger.error(
+                    "memory extractor transport failed err=%s", type(exc).__name__
+                )
+                raise MemoryExtractionTransportError(
+                    "ollama chat transport failed", error_kind="connection"
+                ) from exc
+            try:
+                enforce_no_redirect(response)
+            except PermissionError as exc:
+                redirect_status = int(response.status_code)
+                response = None
+                self._logger.error(
+                    "memory extractor http redirect status=%s", redirect_status
+                )
+                raise MemoryExtractionTransportError(
+                    f"ollama chat http redirect {redirect_status}",
+                    error_kind="http",
+                ) from exc
+            if response.status_code >= 400:
+                self._logger.error("memory extractor http status=%s", response.status_code)
+                raise MemoryExtractionTransportError(
+                    f"ollama chat http {response.status_code}",
+                    error_kind="http",
+                )
+            try:
+                return response.json()
+            except ValueError as exc:
+                self._logger.error("memory extractor response json err=%s", type(exc).__name__)
+                raise MemoryExtractionResponseError(
+                    "ollama chat response is not json", error_kind="json"
+                ) from exc
+        finally:
+            best_effort_close_response(response)
 
 
 class OllamaMemoryExtractor:
@@ -250,6 +331,9 @@ class OllamaMemoryExtractor:
         num_predict: int = DEFAULT_NUM_PREDICT,
         transport: Optional[OllamaChatTransport] = None,
         logger: Optional[logging.Logger] = None,
+        safety_policy: Optional[Any] = None,
+        sealed_endpoint: Optional[Any] = None,
+        model_memory_guard: Optional[Any] = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise MemoryValidationError("model must be non-empty str")
@@ -270,11 +354,17 @@ class OllamaMemoryExtractor:
             "num_predict", num_predict, hard_max=MAX_NUM_PREDICT
         )
         self._logger = logger or logging.getLogger(__name__)
+        self.safety_policy = safety_policy
         if transport is not None:
             self._transport = transport
         else:
             self._transport = RequestsOllamaChatTransport(
-                base_url, timeout=timeout, logger=self._logger
+                base_url,
+                timeout=timeout,
+                logger=self._logger,
+                safety_policy=safety_policy,
+                sealed_endpoint=sealed_endpoint,
+                model_memory_guard=model_memory_guard,
             )
 
     @property
@@ -343,23 +433,28 @@ class OllamaMemoryExtractor:
                 items=(),
                 telemetry=OllamaChatTelemetry(),
                 skipped_locally=True,
+                skip_reason="eligibility_skip",
             )
 
         units = enumerate_safe_fact_units(turn.user_text)
         if not units:
             self._logger.info(
-                "memory extractor no local safe units turn_id=%s", turn.turn_id
+                "memory extractor no local safe units turn_id=%s reason=no_safe_fact_unit",
+                turn.turn_id,
             )
             return ExtractionResult(
                 items=(),
                 telemetry=OllamaChatTelemetry(),
                 skipped_locally=True,
+                local_candidates=0,
+                skip_reason="no_safe_fact_unit",
             )
 
         payload = self.build_chat_payload(turn, units)
         raw = self._transport.post_chat(payload)
         telemetry = parse_ollama_chat_telemetry(raw)
         items = self._parse_response(raw, units=units, turn=turn)
+        selected = len(items)
         if len(items) > self._max_extractions:
             self._logger.warning(
                 "memory extractor truncated count=%s max=%s",
@@ -372,6 +467,8 @@ class OllamaMemoryExtractor:
             items=filtered,
             telemetry=telemetry,
             skipped_locally=False,
+            local_candidates=len(units),
+            selected=selected,
         )
 
     def _parse_response(

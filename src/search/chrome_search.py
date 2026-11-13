@@ -46,7 +46,7 @@ class ChromeSearcher:
         self.auto_open = auto_open
         
         if self.chrome_path:
-            self.logger.info(f"Chrome路径: {self.chrome_path}")
+            self.logger.info("Chrome 路径已配置 has_custom_path=True")
         else:
             self.logger.warning("未找到Chrome，将使用系统默认浏览器")
         
@@ -111,7 +111,7 @@ class ChromeSearcher:
         for path in possible_paths:
             expanded_path = os.path.expandvars(path)
             if Path(expanded_path).exists():
-                self.logger.info(f"自动检测到Chrome: {expanded_path}")
+                self.logger.info("自动检测到Chrome has_path=True")
                 return expanded_path
         
         if self.safety_policy.is_allowed(Operation.REGISTRY_READ):
@@ -126,7 +126,7 @@ class ChromeSearcher:
                         self.safety_policy, hkey, reg_path, context="detect_chrome"
                     )
                     if chrome_path and Path(chrome_path).exists():
-                        self.logger.info("从注册表检测到 Chrome: %s", chrome_path)
+                        self.logger.info("从注册表检测到 Chrome has_path=True")
                         return chrome_path
             except ImportError:
                 pass
@@ -258,7 +258,13 @@ class ChromeSearcher:
         
         self._detected_engine = None
         
-        self.logger.info(f"准备搜索: {query} (引擎: {engine_to_use}, URL: {search_url})")
+        query_chars = len(query or "")
+        self.logger.info(
+            "准备搜索 chars=%d engine=%s has_url=%s",
+            query_chars,
+            engine_to_use,
+            bool(search_url),
+        )
         
         try:
             if self.auto_open:
@@ -268,7 +274,7 @@ class ChromeSearcher:
 
                 if self.chrome_path and Path(self.chrome_path).exists():
                     try:
-                        self.logger.info("使用 Chrome 路径打开: %s", self.chrome_path)
+                        self.logger.info("使用 Chrome 路径打开 has_custom_path=True")
                         import subprocess
                         safe_subprocess_popen(
                             self.safety_policy,
@@ -278,18 +284,36 @@ class ChromeSearcher:
                             context="chrome_search",
                         )
                         engine_name = 'B站' if engine_to_use == 'bilibili' else engine_to_use
-                        self.logger.info(f"已通过Chrome打开搜索: {query} (引擎: {engine_name})")
+                        self.logger.info(
+                            "已通过Chrome打开搜索 chars=%d engine=%s",
+                            query_chars,
+                            engine_name,
+                        )
                         return f"已在{engine_name}搜索: {query}"
                     except PermissionError as exc:
-                        self.logger.warning("Chrome 启动被安全策略拦截: %s", exc)
+                        from src.core.log_privacy import exception_log_label
+
+                        self.logger.warning(
+                            "Chrome 启动被安全策略拦截 err=%s",
+                            exception_log_label(exc),
+                        )
                         return f"[已拦截] 无法打开浏览器: {exc}"
                     except Exception as e:
-                        self.logger.warning(f"使用Chrome路径失败，尝试系统默认浏览器: {e}")
+                        from src.core.log_privacy import exception_log_label
+
+                        self.logger.warning(
+                            "使用Chrome路径失败，尝试系统默认浏览器 err=%s",
+                            exception_log_label(e),
+                        )
                         safe_webbrowser_open(
                             self.safety_policy, search_url, context="chrome_search_fallback"
                         )
                         engine_name = 'B站' if engine_to_use == 'bilibili' else engine_to_use
-                        self.logger.info(f"已通过系统默认浏览器打开搜索: {query} (引擎: {engine_name})")
+                        self.logger.info(
+                            "已通过系统默认浏览器打开搜索 chars=%d engine=%s",
+                            query_chars,
+                            engine_name,
+                        )
                         return f"已在{engine_name}搜索: {query}"
                 else:
                     self.logger.info("使用系统默认浏览器打开")
@@ -297,14 +321,22 @@ class ChromeSearcher:
                         self.safety_policy, search_url, context="chrome_search_default"
                     )
                     engine_name = 'B站' if engine_to_use == 'bilibili' else engine_to_use
-                    self.logger.info(f"已通过系统默认浏览器打开搜索: {query} (引擎: {engine_name})")
+                    self.logger.info(
+                        "已通过系统默认浏览器打开搜索 chars=%d engine=%s",
+                        query_chars,
+                        engine_name,
+                    )
                     return f"已在{engine_name}搜索: {query}"
             else:
-                self.logger.info(f"auto_open=False，仅返回URL: {search_url}")
+                self.logger.info("auto_open=False，仅返回URL has_url=%s", bool(search_url))
                 return f"搜索URL: {search_url}"
                 
         except Exception as e:
-            self.logger.error(f"打开搜索失败: {e}", exc_info=True)
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.error(
+                "打开搜索失败 err=%s", exception_log_label(e), exc_info=True
+            )
             return f"搜索失败: {str(e)}"
     
     def set_search_engine(self, engine: str):

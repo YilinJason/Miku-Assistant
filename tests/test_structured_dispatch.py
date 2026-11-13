@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import unittest
 from typing import Any, List, Optional
-from unittest.mock import patch
 
 from src.core.assistant import MikuAssistant
 from src.core.dispatch_outcome import DispatchOutcome, ReplyStage
@@ -19,12 +18,14 @@ from src.core.handlers import (
 )
 from src.core.router import IntentRouter
 from src.core.router_factory import build_intent_router
+from src.core.speech_queue import PlaybackStatus
 from src.llm.generate_result import GenerateResult, GenerateStatus
 from tests.test_assistant_orchestration import (
     FakeCharacter,
     FakeTTS,
     MemoryConfig,
-    _immediate_thread_factory,
+    _shutdown_assistant_with_player,
+    _wait_player_turn,
 )
 from tests.test_intent_router import FakeController, FakeLLM, FakeSearcher
 
@@ -127,12 +128,14 @@ class RouterAndAssistantStructuredTests(unittest.TestCase):
         tts: Optional[FakeTTS] = None,
         character: Optional[FakeCharacter] = None,
     ) -> MikuAssistant:
-        return MikuAssistant.from_dependencies(
+        assistant = MikuAssistant.from_dependencies(
             config=MemoryConfig({"assistant": {"auto_tts": True}}),
             router=router,
             tts_engine=tts,
             character_interface=character,
         )
+        self.addCleanup(_shutdown_assistant_with_player, assistant)
+        return assistant
 
     def test_system_and_search_priority_unchanged(self) -> None:
         controller = FakeController("sys-ok")
@@ -165,7 +168,7 @@ class RouterAndAssistantStructuredTests(unittest.TestCase):
         self.assertTrue(outcome.allow_character)
         self.assertEqual(llm2.generate_result_calls, [])
 
-    def test_assistant_success_starts_thread_and_forwards_character(self) -> None:
+    def test_assistant_success_uses_player_and_forwards_character(self) -> None:
         llm = StructuredFakeLLM(GenerateResult.success("错误: 台词"))
         router = build_intent_router(
             windows_controller=FakeController(None),  # type: ignore[arg-type]
@@ -175,13 +178,12 @@ class RouterAndAssistantStructuredTests(unittest.TestCase):
         tts = FakeTTS()
         character = FakeCharacter(initialized=True)
         assistant = self._assistant(router=router, tts=tts, character=character)
-        factory = _immediate_thread_factory()
-        with patch("src.core.assistant.threading.Thread", side_effect=factory) as thread_cls:
-            reply = assistant.process_text_input("hello", use_tts=True)
+        reply = assistant.process_text_input("hello", use_tts=True)
         self.assertEqual(reply, "错误: 台词")
         self.assertEqual(llm.generate_result_calls, ["hello"])
         self.assertEqual(llm.generate_calls, [])
-        self.assertEqual(thread_cls.call_count, 1)
+        self.assertIsNotNone(assistant._speech_player)  # noqa: SLF001
+        self.assertEqual(_wait_player_turn(assistant), PlaybackStatus.COMPLETED)
         self.assertEqual(tts.speak_calls, ["错误: 台词"])
         self.assertEqual(character.messages, ["错误: 台词"])
 
@@ -197,12 +199,11 @@ class RouterAndAssistantStructuredTests(unittest.TestCase):
         tts = FakeTTS()
         character = FakeCharacter(initialized=True)
         assistant = self._assistant(router=router, tts=tts, character=character)
-        with patch("src.core.assistant.threading.Thread") as thread_cls:
-            reply = assistant.process_text_input("x", use_tts=True)
+        reply = assistant.process_text_input("x", use_tts=True)
         self.assertTrue(reply.startswith("错误:"))
         self.assertIn("无法连接到Ollama服务", reply)
         self.assertEqual(llm.generate_result_calls, ["x"])
-        self.assertEqual(thread_cls.call_count, 0)
+        self.assertIsNone(assistant._speech_player)  # noqa: SLF001
         self.assertEqual(tts.speak_calls, [])
         self.assertEqual(character.messages, [])
 
@@ -216,10 +217,9 @@ class RouterAndAssistantStructuredTests(unittest.TestCase):
         tts = FakeTTS()
         character = FakeCharacter(initialized=True)
         assistant = self._assistant(router=router, tts=tts, character=character)
-        with patch("src.core.assistant.threading.Thread") as thread_cls:
-            reply = assistant.process_text_input("x", use_tts=True)
+        reply = assistant.process_text_input("x", use_tts=True)
         self.assertEqual(reply, "")
-        self.assertEqual(thread_cls.call_count, 0)
+        self.assertIsNone(assistant._speech_player)  # noqa: SLF001
         self.assertEqual(tts.speak_calls, [])
         self.assertEqual(character.messages, [])
         self.assertEqual(llm.generate_result_calls, ["x"])

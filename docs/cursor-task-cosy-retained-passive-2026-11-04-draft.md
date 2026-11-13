@@ -1,0 +1,19 @@
+# Cosy retained 被动对账（2026-11-04 已放行）
+
+## 已确认问题与边界
+
+engine._assert_turn_stream_admission_resources先拒绝retained_output_count>0，backend._release_retained_outputs才会移除retained条目。若TFM后台已安全清掉文件，但backend仍保留旧集合，新speak/save在到达backend.gate之前永久busy。独立于worker真实stop_failed；不得因本修复自动重启故障worker或绕过retirement/IO pin。
+
+生产只engine.py admission窄调用和cosyvoice_backend.py被动对账小方法，必要tests/doc。前置CPU预算验收前不实施。读AGENTS四skills安全规则，保留所有dirty。禁正式memory/真实模型设备/配置声音权限修改/提交推送/Rootprobe监督器。
+
+## 选择
+
+backend新增窄public passive方法（例如reconcile_released_outputs）：只对本后端retained集合的快照，用TFM.is_owned逐一复核，移除已不owned的条目；不得delete/create/retire/spawn/prepare/IO lease操作、文件扫描或查询外部路径。锁仅保护快照和更新，不持lifecycle锁调用TFM以免锁序扩大。保持_pending_worker_retire与client.stop_failed原状态；真正写入仍必须经过原gate。现有retained集合受TFM owned上限约束，不新增无界缓存。
+
+engine在读取retained门槛前调用被动方法（能力getattr callable兼容旧fake）；TFMpending门槛继续严格，不因被动对账跳过。若已有pending阻止进入，后台清完后下一请求才被动对账。不要调用带两秒worker退休的_gate_synth_allocation，不对异常采用“假设清空”。BaseException原样传播且旧集合保留可重试；并发发生新增retained时不得误删较新未复核条目，不能整体clear。可用一个retained revision（所有add/update包括samepath重加均推进，快照后revision变则保守放弃此轮删除）保证；先审计实际锁序，也可若确认TFM.is_owned只读短锁且无反向持锁回调，选择在lifecycle锁内逐条只读复核以省状态。不能持锁进行文件删除/退休/等待，也不引入新无界map。先在handoff说明选定proof，Root再复审。
+
+## 证明
+
+真实backend+fakeclient/TFM，先让后台状态模拟已释放owned而retained仍>0：下一engine admission可恢复，过程中零create/remove/retire/prepare。仍owned/IO pinned/pending时继续拒绝。pending_worker_retire和stop_failed绝不被清除，新实际synth仍原gate；并发新增路径或重用同path身份不被误清。fake库/设备，不运行真实链路。
+
+主Python312 scoped supervisor显式模块唯一label顺序、超时<=120秒，无raw/discover/Rootprobe。必要existing C1/C2B2A/预取/回滚组；constructor AudioPlayer预先fake，所有gates finally释放与actualjoin/aggregatecomplete之后恢复patch与目录删除。compile/diffcheck、ADR/handoff STOP等Root独立review。

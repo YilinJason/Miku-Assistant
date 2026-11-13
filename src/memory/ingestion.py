@@ -26,6 +26,32 @@ DEFAULT_MAX_EXTRACTIONS_PER_TURN = 16
 MAX_MAX_EXTRACTIONS_PER_TURN = 64
 _WORKER_POLL_SECONDS = 0.05
 
+# 日志可观察的固定 skip_reason；未知/非字符串一律映射为 unknown（禁止 str(任意对象)）
+ALLOWED_INGESTION_SKIP_REASONS = frozenset(
+    {
+        "no_safe_fact_unit",
+        "eligibility_skip",
+    }
+)
+_SAFE_SKIP_REASON_UNKNOWN = "unknown"
+
+
+def normalize_ingestion_skip_reason(raw: object) -> str:
+    """
+    将 duck-typed skip_reason 规范为固定原因码。
+
+    不得对任意对象调用 ``str()``，以免秘密正文或 ``__str__`` 副作用进入日志。
+    """
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        return _SAFE_SKIP_REASON_UNKNOWN
+    if raw == "":
+        return ""
+    if raw in ALLOWED_INGESTION_SKIP_REASONS:
+        return raw
+    return _SAFE_SKIP_REASON_UNKNOWN
+
 
 class MemoryIngestionService:
     """
@@ -461,7 +487,36 @@ class MemoryIngestionService:
                 )
                 return
         try:
-            raw = self._extractor.extract(event)
+            detailed = getattr(self._extractor, "extract_detailed", None)
+            local_candidates = -1
+            selected_count = -1
+            skip_reason = ""
+            if callable(detailed):
+                result = detailed(event)
+                raw_items = getattr(result, "items", ())
+                lc = getattr(result, "local_candidates", -1)
+                sel = getattr(result, "selected", -1)
+                local_candidates = (
+                    int(lc)
+                    if isinstance(lc, int) and not isinstance(lc, bool)
+                    else -1
+                )
+                selected_count = (
+                    int(sel)
+                    if isinstance(sel, int) and not isinstance(sel, bool)
+                    else -1
+                )
+                skip_reason = normalize_ingestion_skip_reason(
+                    getattr(result, "skip_reason", None)
+                )
+                if raw_items is None:
+                    self._logger.warning(
+                        "memory extractor returned None turn_id=%s", event.turn_id
+                    )
+                    return
+                raw = raw_items
+            else:
+                raw = self._extractor.extract(event)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:  # noqa: BLE001
@@ -503,6 +558,8 @@ class MemoryIngestionService:
             items = items[: self._max_extractions_per_turn]
 
         accepted = 0
+        created = 0
+        deduped = 0
         for index, item in enumerate(items):
             try:
                 extracted = self._coerce_extracted(item)
@@ -513,8 +570,12 @@ class MemoryIngestionService:
                     importance=extracted.importance,
                     confidence=extracted.confidence,
                 )
-                self._store.add(draft)
+                write_result = self._store.add(draft)
                 accepted += 1
+                if getattr(write_result, "created", True):
+                    created += 1
+                else:
+                    deduped += 1
             except (KeyboardInterrupt, SystemExit):
                 raise
             except MemoryError as exc:
@@ -531,11 +592,27 @@ class MemoryIngestionService:
                     index,
                     type(exc).__name__,
                 )
-        self._logger.info(
-            "memory ingestion processed turn_id=%s accepted=%s",
-            event.turn_id,
-            accepted,
-        )
+
+        if local_candidates == 0 and not skip_reason:
+            skip_reason = "no_safe_fact_unit"
+        if local_candidates >= 0:
+            self._logger.info(
+                "memory ingestion processed turn_id=%s accepted=%s "
+                "local_candidates=%s selected=%s created=%s deduped=%s%s",
+                event.turn_id,
+                accepted,
+                local_candidates,
+                selected_count if selected_count >= 0 else len(items),
+                created,
+                deduped,
+                f" reason={skip_reason}" if skip_reason and accepted == 0 else "",
+            )
+        else:
+            self._logger.info(
+                "memory ingestion processed turn_id=%s accepted=%s",
+                event.turn_id,
+                accepted,
+            )
 
     @staticmethod
     def _coerce_extracted(item: object) -> ExtractedMemory:

@@ -1,0 +1,9 @@
+# Codex跨Python文件身份评审
+
+最终：返修复查通过。Windows FILE_ID_INFO完整卷64位+文件128位、ctypes签名、fd finally、child打开后expected检查符合方案；不改全局安全/RVC。独立8项实际跨Python测试OK；独立owner-race probe现为entered_worker_start=0、owned=false。client追加TFM登记与原portable pair复验符合修复设计。允许默认30秒受控cold/warm/idle smoke；以下为已修复依据。
+
+`client.synthesize`先TFM assert，再capture_file_identity，再capture_portable。若在portable读取时替换路径，portable指向新文件，之后child认为这是父授权文件并可能写入；父事后虽会拒绝结果，已经发生了对替代物的写。Codex隔离探针`tmp/codex_portable_owner_race.py`复现entered_worker_start_with_unowned_replacement=1、owned=false，无模型/子进程。
+
+最小修复：收集stdlib与portable快照并完成原始路径校验后，在_begin_request/启动/发送之前，再次调用同一TFM的assert_owned_regular_file，确认仍是注册原identity；任何失败拒绝且零spawn。不要重新登记/收养替代文件，不用新文件的身份更新原登记。原portable pair必须保留供child打开后比对，后续替换仍由原pair拒绝；父原FileIdentity继续验证结果。可用等价单句柄+TFM注册身份比对，但不扩大全局接口为本任务特殊模式。
+
+增加真实TFM行为测试：hook portable capture时把原文件移至同目录hold再创建替代，assert零_ensure_worker_started/零Popen，TFM不拥有替代物；清理只本测试owned/隔离目录，不删历史临时文件。正常owned/原别名拒绝/替换推理中/父复验测试均保留。只改client及相关测试，不必再跑全量；专项+新8项identity即可，Cursor停下Codex独立复验后真实smoke。

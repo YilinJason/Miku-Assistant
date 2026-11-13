@@ -13,6 +13,7 @@ from typing import Any, Iterator, List, Optional
 from unittest.mock import patch
 
 from src.cli import voice_session as voice_mod
+from src.cli.voice_preflight import VoicePreflightReport
 from src.cli.voice_session import VoiceSession, run_voice_session
 from src.core.assistant import MikuAssistant
 from src.core.dispatch_outcome import DispatchOutcome, ReplyStage
@@ -341,7 +342,7 @@ class VoiceStreamTurnTests(unittest.TestCase):
             assistant.shutdown()
 
     def test_playback_timeout_keeps_history(self) -> None:
-        client = OllamaClient(base_url="http://fake-ollama", model="test")
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="test")
         client._history.commit_turn("seed", "ok")  # noqa: SLF001
         before = list(client.conversation_history)
         resp = ControllableStreamResponse(
@@ -513,7 +514,9 @@ class VoiceStreamTurnTests(unittest.TestCase):
         assistant = self._make(llm=FakeLLM("x"), tts=FakeTTS())
         try:
             with patch.object(voice_mod, "VoiceSession", CaptureSession), patch.object(
-                voice_mod, "ensure_voice_ready", return_value=True
+                voice_mod,
+                "check_voice_preflight",
+                return_value=VoicePreflightReport(ok=True),
             ):
                 run_voice_session(assistant, stream_reply=True)
                 run_voice_session(assistant, stream_reply=False)

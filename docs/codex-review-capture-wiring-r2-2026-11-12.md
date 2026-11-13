@@ -1,0 +1,13 @@
+# Wiring R2 — one remaining concurrent-start defect
+
+Initial5rootchecks nowpass: input_v2_wiring_contract_nov12az. RealSTT+controller+CPU NS/VAD withfakefilesource+fakeASR passes25noise+1voice andlateASRcancel: input_v2_wiring_native_nov12ba,27captureweakrefsreclaimed, sessiongone. Reporttmp/capture_wiring_native_20261112_7eda04156d8f.json. No mic/device/actualASR orplayback.
+
+Extendedrootgate input_v2_wiring_start_race_nov12bb (6checks) failsone: AandB bothpassinitialempty-slotcheck thenprepareoutsidegate. A publishesandstarts; B lateracquiresSECONDpublicationgate, seesexistingrunningcapture butstillcalls `.start()` again. Controllerreturnsalready_runningFalse, andBthenCLOSESA'svalidsession. Rootobservedstarts[1,1].
+
+Fix SECONDgate exactlyasinitialgate: ifsameepochcurrentcontrolleralreadyrunning returnTrue/idempotentwithoutcallingstart/close; ifownednotcomplete/notrunning returnpendingFalse WITHOUTclosinganothercaller'sowner. OnlycallerwhichCREATED/PUBLISHEDnewcontroller maycallits.start orcleanup itsfailedstart. Completedcontrollercanbecleared/replacedonlyafterconfirmedcomplete. Keepepoch/globalclosechecks andidentityclose. Do notaddnewflag/stateframework orweakenoriginaltests.
+
+Addformalbarriertest: AandB bothblockedinsidepreparation; releaseA,start/finishA; releaseB; factory/startcount1,closecount0beforeexplicitstop, firstsessionstillactive. Captureeverythreadexception/finallyreleasejoin. No rootprobeexecution/editing.
+
+Smallcleanupwhilehere: normalizeoverindented `_run_duplex_loop`body, removeunusedexit_reasonleftover anddocument`currentthreadconsumessegments`ratherthanclaimsitownsphysicalmic. Ensurependingcapturestatus doesn'tfabricateASRworker_aliveFalse ifactualclientworkerexists; reuseexistingqueriedclientstatus.
+
+Same19fake modules supervisorONLY, labelinput_v2_wiring_r2_cursor_nov12bc, timeout90. STOPforindependentreview. No otherphase/device/model/pip/app/data/memory. CoreDSP/nativepathunchanged; don'trerunrootnative.

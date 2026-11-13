@@ -1,0 +1,29 @@
+# Capture wiring R1 — 5 independently reproduced failures
+
+Rootboundedfakegate `input_v2_wiring_contract_nov12aw` ran5tests andfailedALL5; no devices/models. Readonlyreviewerprobe `tmp/codex_capture_wiring_contract_2026_11_12.py` (do NOTedit/run). Author311testpass doesnotcoverthesebehaviors.
+
+## 1. Serial compatibility regression
+
+SerialVoiceSession also callsrecognize(continuous=True). Routing solelyby `_continuous_capture_wanted` nowreturnsNOT_READY whenserialsessionhasnotbeguncapture. Selectcaptureconsumption by ACTUALowned/startingcapture, nottheconfigurationeligibilitypredicate. Withoutanexplicitduplexbegin andwithoutpendingowner, preservelegacy `_recognize_with_microphone`; neverautoopencapturefromrecognize. Ifanownedcaptureispending/error, failclosedinsteadoflegacymicfallback. TestrealSTTEngine withdefaultsettings+mocklegacylistener, nocapturebegin.
+
+## 2. VoiceSession cleanup is ineffective
+
+Currentreturns inside try freezeexitvalue; finally'sassignmentexit_reason hasnoeffect. EndFalsecurrentlyreturns'exit', notunsafe_pause. BeginFalse/exceptionnevercallendbecausecapture_session flagsetonlyafterbeginTrue.
+
+Restructurecleanly: outer `_run_duplex` ownsbegin/end lifecycleandstoresoutcome; moveexistingduplexloop (withitsreturnstatements/replyfinally) into `_run_duplex_loop` helper. SetattemptedBEFOREcallingbegin. RunlooponlyifbeginTrue; compatibilitymissingbegin runsloop. CatchKeyboardInterrupt=>exit, ordinarybegin/loopfail=>stt_error/stablehint; finallycallendforallattemptedbegins (includingFalse/exception), catchordinarycleanupfailure=>False. Afterfinallyreturnstoredoutcome; nonliteralTrue/exceptioncleanup MUSTsetunsafe_pause. No return-in-finally. Ensureactive_replyinterruptionstillruns evenifendraises. Serialneverbegin/endbackgroundcapture. Formaltestsforall4outcomes+begin/endFalse/error/KeyboardInterrupt.
+
+## 3. Shutdown can be followed by late microphone start
+
+Rootblocks `_ensure_silero_vad`, completesengine.shutdown(), thenreleasespreparation: currentcodepublishesnewcaptureandcallsstartAFTERpermanentclosure. Recheckshutdown/permanentclosed insidepublicationgate afterpreparation. Also MODEstop (withoutglobalshutdown) canwinwhilepreparation: addsmallgeneration/epochcapturedatstart, incrementunderenginegateonanysessionstop/shutdown, comparebeforepublish/start. No nativecallswhileholdinggate. Existingcontrollerisvisiblebeforethreadstart andstopsafe ifstopwinsafterpublication. Rejectconcurrentsecondstart ofnot-yet-runningownedcapture; don'tinvokecontroller.starttwice. Testbarriersforbothshutdown andmodeexitduringpreparation, pendingstart, successfulreenterafterconfirmedstop, pendingstopblocksreplacement.
+
+Stopandshutdownshouldshareoneprivateclosehelper; ALWAYScloseownedreference regardlessofcurrentwanted/configpredicate. Currentstop clearsownedcapturewithoutclose ifsettingschange. Catchordinaryclose/statuserrors intoFalse/pending while retainingref. No flagmayclaimcompleteifcaptureowned/startinflight; statusworker_alive shouldreflectexistingASRclient evenwhilecapturepending. Avoidduplicatedstickyflags; bindanyfailedstopstate tocurrentowner. Checkcapturebeforeearly `_permanently_closed` success.
+
+## 4. Read-only cancellation is only a comment
+
+stop_cancel_view returnsactualthreading.Event withset/clear. Returnasmallview exposingONLYis_set; underlyingmutableeventstaysownedbycontroller. Rootassertsnoset/noclear. Oncaptureconsumption verifycurrentowner/session/generation beforeandAFTERASR, recheckcombinedcancel/shutdown beforesuccesspublication evenifinnertranscribe returnslateSUCCESS. Carrycapturetimingonlyforvalidcurrentsegment. IfgenerationchangesduringASR, cancel/dropoldgeneration; preferablyreadonlyperturncancelview observesgeneration forclientpollingtoo. No newthread/queue ortextlogging.
+
+## 5. Missing proof and diagnostics
+
+FormaltestscurrentlyhavenoCLIbegin/endfailureproof; addbehavioraltests mirroringreporteduserpaths. KeepoldunstartedSTTdiagnostic/serial behaviorcovered insteadofchangingits test toexpectNOT_READY. Usebarriers/finallyjoin/errorcaptureforallthreads. FakeMic/PyAudio/ORT/APM blocked. Logfixedcapturemode+NS+VADsummaryoncewithouttext; updateREADME/VOICEactualbehaviorandfallback. Configurationdefaultandtimingvalidation directionisgood.
+
+Only documented19fake modules throughsupervisorlabel `input_v2_wiring_r1_cursor_nov12ax`, timeout90, MAINPython312. Unique labelsforreruns; no rawunittest/rootprobes/native/device/app/pip/data/memory/otherphase. STOPforCodexreviewandfixedfileintegration. No echo-policy/AECchangesyet.

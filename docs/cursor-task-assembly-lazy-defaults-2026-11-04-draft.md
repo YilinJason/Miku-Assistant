@@ -1,0 +1,9 @@
+# 当前资源切片：装配默认工厂按需导入（2026-11-04已放行Cursor）
+
+前置五包lazy已Root46测试通过。Root新鲜解释器meta_path拒绝src.voice.tts.engine，import src.core.assembly仍触发受控ImportError；原因不是构造组件，而是文件顶端import及四个函数默认实参TTSEngine。此项属于当前启动资源板块，不提前进入有界预取/独立精简。
+
+实施前重新读AGENTS/skills、git status及assembly/assistant/voice_load_lane调用与相关测试。保留dirty；未提交推送；不得启动设备/模型/清理或读正式memory。范围优先assembly、新测试、短ADR。优先两个可调用的窄默认工厂（函数内部import真实类后原样转发kwargs构造），替代四个函数签名的类默认值；不改变显式传入None的旧错误行为。保留外部tts_engine_cls/stt_engine_cls注入、AssembledParts向App延迟传工厂、kwargs/回滚/首次候选所有权/互斥语义；不要在assemble_default text路径提前解析真实类。不要为绕过测试改Core关闭验证。Root检索当前tests/src/scripts未发现assembly.TTSEngine/STTEngine外部引用；仍保留module级兼容导入名，必要时PEP562暴露，普通assembly import不能触发。wrapper只延迟解析，不另建线程、锁或复杂缓存。已有包globals缓存负责真实类identity。
+
+测试在新鲜解释器用sentinel拒绝TTS/STT实现及numpy/scipy/torch/soundfile：import assembly和assistant不应触发语音实现；text/interactive装配用既有fake配置/模型/清理器，不读真实memory或主配置，确认无声音构造；之后显式语音请求仅一次真实类解析（fakeimport实现/实例，不开设备），注入工厂路径不导入真实类。voice模式构造/失败回滚/kwargs保持，依赖导入失败沿现有事务失败/owner路径，不吞KBI，不自动重复加载。仅相关offline gate：lazy exports、assembly_rollback、mode_assembly_round2、App_voice_activation、voice_foreground_bound。先读实际测试避免误启动副作用，无全量discover。
+
+本稿已由Root审阅并放行，保留文件名便于旧链接恢复；当前额度primary used1%。按本文件执行此切片，测试后交接STOP待Root，不启动下一部分。随后继续系统commit准入/RVC重复健康预检与失败重试，不以本项声称三模型共存达标。生产与测试由Cursor写；Root独立验证，不能改Root探针或篡改旧关闭断言。

@@ -1059,7 +1059,7 @@ class StreamingAssistantTests(unittest.TestCase):
 
     def test_playback_failed_after_complete_real_client(self) -> None:
         """真实客户端 COMPLETED 后尾句入队失败：stage=PLAYBACK_FAILED，历史提交一次。"""
-        client = OllamaClient(base_url="http://fake-ollama", model="test")
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="test")
         client._history.commit_turn("seed", "ok")  # noqa: SLF001
         before_len = len(client.conversation_history)
         # 增量无句末，COMPLETED 时 finish 才刷尾句 → 入队失败在生成提交之后
@@ -1127,7 +1127,7 @@ class StreamingAssistantTests(unittest.TestCase):
 
     def test_cancel_on_delta_does_not_commit_real_client_history(self) -> None:
         """真实 OllamaClient：on_delta 取消后不得再 next 触发 commit_turn。"""
-        client = OllamaClient(base_url="http://fake-ollama", model="test")
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="test")
         client._history.commit_turn("seed", "ok")  # noqa: SLF001
         before = client.conversation_history
         # 单行 content+done=True：第一次 next 出 delta，第二次 next 才会 _complete
@@ -1158,7 +1158,7 @@ class StreamingAssistantTests(unittest.TestCase):
 
     def test_two_deltas_then_done_cancelled_by_new_turn(self) -> None:
         """两行 delta 后 done；旧轮被新轮替代时不得再 next，历史不得提交。"""
-        client = OllamaClient(base_url="http://fake-ollama", model="test")
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="test")
         client._history.commit_turn("seed", "ok")  # noqa: SLF001
         before = list(client.conversation_history)
 

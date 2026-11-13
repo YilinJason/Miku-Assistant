@@ -24,7 +24,7 @@ def build_vc_kwargs(
 
     默认值针对 Nahida 日常对话做了偏「干净、少电流感」的调优：
     - index_rate 略降，减轻检索带来的颗粒感
-    - protect 提高，保护清辅音/气声，减少伪影
+    - protect 低于 0.5 时增强清辅音/气声保护（0.5 为关闭）
     - rms_mix_rate < 1，混合源音量包络，听感更自然
     """
     index_path = resolve_index_path(rvc_config)

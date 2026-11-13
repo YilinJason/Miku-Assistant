@@ -1,0 +1,45 @@
+# TFM deadline Root最终验收 PASS
+
+最终源码逐行及fixture复审完成。Root独立8/8（tfm_deadline_root8_final_20261104e）、仓库43/43（tfm_deadline_root_repo_final_20261104e），相关语音/安全131/131、原所有权9/9、stale1/1、claim5/5均通过（有重叠，不相加为全仓一次）。所有gate无超时，WAV826精确集合零差。新增独立矩阵确认future自动执行/ready容量1、锁退避让出、重复绝对due、pin到期不重启、耗尽与显式重试、ready新pin/永久错误fence、逾期blocked不遮挡最近eligible。
+
+旧Root同步钩子仅迁移到真实get/delete边界，原断言保留；删除四项零引用兼容残留。单worker、有界pending/ready、锁外精确身份claim、unknown-start actualquiet和总关闭预算保持。默认容量不变，无其它语音/模型/权限改动。官方Cursor会话9dac0f47-61c8-46e1-abc6-ff54e236921c全部STOP。允许进入LLM冷载保护；不表示真实共存或长测已通过。以下为历史失败依据。
+
+## 里程碑最后idle选择问题
+
+最终repo42/42与相关131/131、独立7/7及旧9/1/claims5均PASS。但最后资源审查发现_worker_idle_wait_timeout_locked在遍历到第一个due<=now且blocked的记录时直接return .5，遮挡后面实际上可处理的较近future deadline。例如逾期pinned A在首、B due=.08，B无新通知时被延迟到.5。应skip blocked，继续扫描所有可处理record，最近eligible due优先；只有没有eligible候选且仍有pending才.5巡检。不能简单遇首blocked立即返回。Root追加独立第8项明确证明此边界。
+
+仅这一小段源码和必要新行为测试/ADR，移除先前未用兼容残留保持；其它生产冻结，compile/diffcheck后STOP不跑tests/gate。此窄修后Root8+repo42/新增模块最终复验，原131不重复未变路径。
+
+## Root最终功能通过，最后测试helper错误与死代码收口
+
+独立deadline7/7、原所有权9/9、旧身份1/1均PASS，生产行为已证明。repo42组8ERROR：test_tfm_deadline新插入_wait_inflight_quiet时误删了`def _finish_tfm`头，shutdown代码被并入_wait函数，调用_finish全NameError，且_wait提前shutdown删掉待重试文件。必须恢复两个独立函数：_wait仅有界等待inflight0不关manager；_finish负责shutdown/complete/owned0/workerdead。不要修改业务断言掩盖这个问题。
+
+经Root全src/tests搜索，temp_files.py `_PendingCleanup`别名、_enqueue_pending_item_locked、_offer_delayed、_wait_interruptible现均只定义无调用，Root旧probe也已迁移到真实get/delete同步点。可同时删除这些确定未用的私有兼容残留，减重复责任；其它生产行为冻结。这是本切片最后保行为清理，不引新抽象。
+
+请完整读最终文件静态核对helper定义/调用，不能仅compile视作验证。仅源上述死代码/tests/doc+compile/diffcheck STOP，不跑tests/gate，不改Rootprobe监督器/报告。Root自行重跑42与7，之后验收。sharedWAV仍826，无本轮残留。
+
+## Root fixture最后窄修（生产冻结待独立7复验）
+
+LockBackoffYieldsWorkerTests的tracked_remove对locked_path永远PermissionError，finally在patch内_finish必定owned/pending非零；增加allow_cleanup事件/状态，finally先允许精确owned删除再_finish，不得删owned登记或假complete。ExplicitExhaustedPublicRetryTests在计数2即调用显式重试，有机会先于后台耗尽发布；用公开inflight_count==0的有界等待确认本次尝试已结束后再重试，不能只看回调开始计数。
+
+MissingFileDoesNotStopPeerTests改成os.path.exists只对ghost返回False，实际文件仍存在而manager被迫revoke，造出丢owner的真实文件；禁止这种假missing。使用已有dequeue门闩，在ghost仍精确owned+policy.is_path_deletable为True之后，在独占fixture里raw_remove该唯一文件模拟外部消失（同一受控os.remove patch须scope对target检查），再放行队列，不patch exists，不产生孤儿。其它生产逻辑冻结，本轮仅tests/docs+局部compile/diffcheck STOP，不运行测试。
+
+## Root复审b（唯一生产剩余复现 + fixture统一修正）
+
+独立扩7项6PASS/1FAIL，tfm_deadline_root7_review_20261104b，WAV826零差。**显式remove_delayed耗尽重试仍没改**：nonpin分支_enqueue_delayed_locked调用_note未传refresh，pending已存在便return。仅在公共remove_delayed合法identity+权限确认后传refresh_exhausted=key in_retry_exhausted，确保max_retries=0仍至少一次；内部pump/lease不能刷新。补真实2次锁失败→耗尽→允许删除→同path公开remove_delayed显式重试成功测试，不要直接写_retry_exhausted冒充此证明。
+
+新tests还未运行，因为PinDeferReadyDequeueTests目前schedule due0启动线程后poll queued再pin，线程通常早已删文件，这不是确定性竞态。改用queue.get_nowait一次门闩（在manager锁外），等实际worker在取出前暂停，再pin并入peer→release→peer删除；finally release所有门闩/token并patch内实际shutdown。MissingFile测试同样在worker取项前暂停，由明确通过policy.is_path_deletable+精确fixture身份检查的外部故障模拟移除ghost，再release，不能与真实worker竞争unlink或只在删完后patch观察。新StaleReadyExhaustedFenceTests直接灌私有marker为镜像，可删除重复项，Root已有真实foreground永久错误旧ready测试，或改真实公开触发并保持worker明确同步。
+
+所有validate/latency/永久失败测试要finally，patch应活到实际join。不要新增无法外层join的lambda线程；源码冻结除上述显式retry窄修，Root独立矩阵其它6项不变。局部compile/diffcheck/handoff STOP，不运行测试。
+
+初稿生产及新fixture尚不能验收；不进入LLM板块。Root已读逐行快照差异和新tests，必须统一处理以下问题，不只改某个失败测试。
+
+Root独立初稿5项3FAIL：tfm_deadline_root5_review_20261104a（future没启动、单future/重复不执行、显式重试不能刷新耗尽），WAV826零差。尤其普通remove_delayed非pin路径的_enqueue_delayed_locked目前_note不传refresh_exhausted，**任意正预算**也不能刷新旧耗尽记录，不能只修max_retries=0。公共显式重试应在确认当前owned identity后刷新，内部自动pump/lease释放不能刷新。
+
+1. **未来任务不会启动worker**：_enqueue_pending_item_locked仅返回key是否ready，_enqueue_delayed_locked/_offer_delayed沿用此返回决定start；future只入pending，单独remove_delayed(path,.4)不会创建worker，永远不删。接受合法非耗尽pending就需要在锁外确保唯一worker（即使当前未到期或ready满），不能以已入ready作为启动条件。
+2. **break误退出整圈worker**：新worker去掉for attempts后，文件不存在/_can_delete False/claim失败三处break现在退出while而非仅跳此项，别的任务无消费者。改continue或小型一次处理helper，保持finally release/count/task_done。pin可在ready和dequeue之间加入，暂不能删必须保留pending并继续其它任务；不能永久终止消费者。
+3. **权威pending未在dequeue复核**：当前只比owned identity，未读record/remaining/exhausted/due。某路径已在ready，前台remove发生永久失败并置_retry_exhausted，旧ready仍会自动重试。必须锁内复核当前匹配record+非exhausted+due；暂未来/pin/claim时清本条ready标记、保留pending，不撤较新identity的queued标记，不因旧载荷恢复耗尽预算。显式retry max_retries=0也按原至少一次。
+4. **唤醒/claim释放责任**：idle=None可能while全候选被delete_claim阻挡时无限Event.wait，_release_delete_claim_locked并不wake。应在claim释放/相关阻挡解除处唤醒，或存在pending时保留<=.5秒安全巡检；不要有pending却无限睡，不能用高频busyloop。stop前/clear后通知边界继续保留。
+5. **新tests可靠性**：test_tfm_deadline validation case仅成功末尾_finish，没有finally；两个tracked_remove case finally在patch外，不满足资源责任。统一独占目录、finally在patch内_finish确认complete/owned0/workerdead后恢复，外层可幂等兜底。增加只future自动到期、pin在ready/dequeue竞态、旧ready耗尽fence、不存在/identity变化仍推进别项等行为覆盖。旧StaleQueueWorker测试同步门闩若移到真实remove持claim，则旧对mgr.remove(blocker)的相互等待必须审计，不能盲跑挂起。
+
+只源/必要tests/docs、局部compile/diffcheck后STOP，不运行测试/Rootprobe/监督器，不覆盖报告，不改其它模块/正式memory/配置/模型设备。Root继续独立复验与旧矩阵，ADR未Accepted。

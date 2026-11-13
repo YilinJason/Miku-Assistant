@@ -70,7 +70,7 @@ def _ndjson(*objs: Any) -> List[Any]:
 
 class GenerateStreamTests(unittest.TestCase):
     def _client(self) -> OllamaClient:
-        return OllamaClient(base_url="http://fake-ollama", model="test")
+        return OllamaClient(base_url="http://127.0.0.1:9", model="test")
 
     def _seed(self, client: OllamaClient) -> List[dict]:
         with patch(

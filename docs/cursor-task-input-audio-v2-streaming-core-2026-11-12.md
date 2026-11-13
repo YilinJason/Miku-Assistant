@@ -1,0 +1,25 @@
+# Streaming core slice — DSP continuity and bounded utterance evidence
+
+Read AGENTS/skills/safety, Phase2a+NS acceptance docs, design-input-audio-continuous-2026-11-12.md. Preserve dirty work. Cursorauthorsproduction/tests, Codexreviews/nativefixedfiletests. No device/app/model/pip/cloud/cleanup/data/memory/gitmutations. This slice implements CORE ONLY, no microphone integration or default capture switch yet.
+
+## Silero stream without a second session
+
+Add a small stream-state API behind existing verified `SileroOnnxVAD`: create one streaming context from an owner, process exact512sample/1024byte frames (16kmono signed16), keep `[2,1,128]`state+64samplecontext across frames. Batchscore remains resetbetween calls and returns existingVadScores. Factor common nativeframe inference/validation rather than copythemodel loop. No prefixreplays/newsessionperframe. Streamstatearrays belong to context, owner retains atmostONEactivecontext, cannot create unlimitedcontexts. Frameoutputs useexistingVadScores withoneprobability/valid512, or equivalent narrowtypedresult. Stream API moduleimportstdlib-only, lazynativefirstframe. Batch andstreamshareowner'sexistingnonblockinglock; busyfailfast, no newthreads. Preserve existing sessionhash/graphCPUvalidation.
+
+Clear/reset streamstate at explicitnewstream/end/gap. Closeowner must invalidate/releasecontext arrays and session; contextclose must NOT closeowner'ssession (may be reusedbybatch). No inferenceafterstream/ownerclosing/cancel, includinglastframe. Cancellation/nativeoutputfailure invalidatescurrentstreamstate so caller cannot splicecontinuityaftererror; newcontextrequired. Contextclose nonblocking/bounded and identity-safe; no nativefreewhileinferenceactive. Preserve currentclosepending/retrysemantics. Test contextandownerclose duringfakeframe.run usingbarriers, explicitjoinfinally/noexceptionswallowed. Holdingconstantstreamstate mustnotretaineveryframePCM/results.
+
+## Incremental NS
+
+Expose minimal owned `WebRtcNoiseStream` (or equivalent) fromnoise_suppression.py sharing fixedfactory/validation withacceptedbatchfunction. `process_chunk(pcm, cancel_event=None)` accept boundedchunks up to4096bytes, mono16ks16 including digitalzeros, accumulate atmost159residualsamples, processonlycomplete160sampleframes; no perchunkpadding. Explicitfinish emitslastvalidresidual once withpad/truncate. Preserve samplecount/chunkboundaryinvariance. RAII/nativeprocessor lifetime oneperstream, resetbynewstream; close discardsresidual+releasesprocessor, boundedpendingifnativeprocessisrunning. No backgroundthreads. Batch `suppress_utterance_pcm` should wrapstreamchunking/finish withsameold15seccap/resultsemantics, notduplicateDSPvalidation/loops. FixedNSlevel1/HP, AEC/AGCfalse remainunchanged.
+
+## Pure bounded segmenter
+
+New small `src/voice/input_segments.py`, stdlibonly. Input fixed512sample frame+finiteprobability0..1 + consecutive samplecounter/streamgeneration; emitfrozen segment(pcm,start/end sampleindices,VADvoicedevidence). Keep256mspreroll, confirm3consecutiveframes>=.6(96ms); end20quietframes640ms with lowerthreshold.45; minvoicedevidence counts>=.6 only; finaladmission min180ms/consecutive90ms/ratio.12 byrealvalidsamples. Defaultsprovisional, noextrauserconfigfieldsinthisslice. Maxutterance12secINCLUDINGpreroll andtail, neverprotocol480000bytes; ifmaxnotframealigned clampdown towholeframes. Longspeechsplits withoutduplicatingpastPCM orlosingcurrentframe, explicitend_reason. On gap/error/reset clearcurrentsegment/ring/evidence. Idlememoryconstant, no growing probability/PCMhistory. Explicitfinish should onlyemitif admission satisfied, no paddedfakeevidence. Timestampslater derivedfromsamplecounterandcaptureanchor, don'tpretendthesearesystemdevicecapturetimestampsyet.
+
+No asynchronousqueue/worker untilnextslice; completedsegmentonlyreturnedtocaller. Avoidunnecessarygeneralplugin/configframework or unrelatedrefactor. Comments explain32ms/10msalignment,stateownership,hysteresis,limits.
+
+## Formaltests
+
+tests.test_input_audio_streaming (fakeORT/APM/Micblocked), tests.test_input_segments (purefakeframes). CoverchunkboundaryNSinvariance/tailzero, singlecontext/modelreused, batchindependence, reset/end/close/cancel/busy/nonfinite/geometry, gapreset, lowgainPCMnotenergyfilteredbysegmenter, shortwords/longspeech/pre-rollcount/exactmaxlimit, idle50kframesbounded, falseframesnoemission, rejectedsegmentsnoPCMemit. Assertjoinedthreadsandpropagateerrors. IndependentnativeequivalenceandresourcechecksbyCodexlater.
+
+SelfcheckexistingboundedsupervisormainPython312, label `input_v2_stream_core_cursor_nov12w`, modules tests.test_input_audio_streaming tests.test_input_segments tests.test_noise_suppression tests.test_numeric_bootstrap tests.test_silero_stt_integration tests.test_silero_vad_adapter tests.test_input_audio tests.test_stt_contract tests.test_local_asr_final_switch tests.test_paraformer_races_round2 tests.test_assembly_rollback, timeout90. No realmodels/devices. STOPforreviewbeforecaptureintegration. DocumentactualcoreAPIandpendingcaptureinshortADR, do noteditCodexreviewdocuments.

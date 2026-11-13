@@ -1,0 +1,31 @@
+# 预热线程泄漏专项：Root最终验收通过
+
+## 当前结论：已修复并独立通过，以下返修均为历史
+
+官方Cursor会话ba4849df-3dd6-415c-aff0-1aabbecdc855已STOP。Root独立llm_warmup_root8_final_20261104c：8项通过（实际默认Core关闭、unknown-start不重复、published-before-start、终态与实际退出、取消迟返、准入恰一次、失败factory不忙等、100轮回收）；llm_warmup_repo_final_20261104f：8模块152项通过。报告exit0/未超时/WAV826零差。中间fixture失败与双准入失败报告全部保留，不作最终通过证据。
+
+100次真实线程+fake请求的预热循环后，OllamaClient weakrefs=0、线程1→1。生产用OwnedThreadTask单owner及start_pending，start/join/HTTP锁外；等待用Condition避免未start/已quiet空转。默认assembly将memory包装前的原LLM作为llm_warmup_owner登记，rollback固定捕获；Core独立strict close纳入completion，失败可重试，DI调用方所有权不变。HTTP POST共享准入一次，取消后的空暖机载荷不晚发模型POST，显式卸载豁免保持。
+
+这关闭了可复现的应用层线程/对象滞留缺口，不证明旧系统内核池/约60GB高占用归因于Miku，也不证明真实模型长期无泄漏。下一仅HTTP响应显式回收切片，真实模型/声音/正式data/memory本轮未访问，未提交推送。
+
+## Root第二次独立7矩阵：6项通过，只剩双准入（下方初稿7项已修）
+
+llm_warmup_root7_review_20261104b：默认Core关闭、unknown start、published/start pending、terminal非实际退出、metadata迟返取消、100次线程/weakref回收通过；只有warm_up一次却发2次metadata GET失败。WAV826零差。原问题修复有效，但新增warm_up先_enforce，再_request_post又_enforce，重复预算还留下第二次检测迟返后未检查closing的旁路。
+
+**最终源窄修**：warm_up删除额外手动_enforce/对应重复except，恢复统一_request_post准入一次。在_request_post中识别固定chat的空messages且非卸载（payload_exempt_from_model_admission=False）作为暖机加载，在共享_enforce返回后、实际HTTP POST前检查_warmup_closing；关闭则受控失败不发POST。warm_up入口提前closing检查仍可保留。卸载豁免和普通生成保持，不要在两个地方重复guard或加能被外部传入的skip_guard开关。_start_published_warmup_owner可返回owner.start实际bool，start_warmup在取消未真正启动时不能无条件True，fresh同理不能声称启动成功。
+
+**fixture仍未完全收口，不跑仓库测试**：取消慢warm、fresh代际、factory/fatal、assembly memory wrap/concurrent等测试close还在patch外或不在finally；gate超时returnFalse掩盖错误。对所有有资源case统一在patch内try/finally：release→实际join/strict close→断言errors/dead→退出patch→删私有目录。concurrent join后必须assert两线程dead且finally完成回收；不要finally:pass。tests/test_security_round3_milestone.py:193这段release.wait(5)未检查、没有entered、patch在close前退出，必须一起修。旧Cosy两处warmup API迁移例也finally在patch内close。不修改其它生产逻辑，不运行任何tests/gate/Rootprobe，AST/diffcheck后STOP。
+
+官方Cursor会话ba4849df-3dd6-415c-aff0-1aabbecdc855初稿STOP后Root逐行比对快照。以下为源码确认问题，必须统一修完再STOP，不能只修一项或自行运行测试。
+
+1. **装配类被意外删除**：assembly.py插入_type_declares_close_warmup时删掉`class _RollbackRegistry:`，其docstring/方法被缩进到helper return后不可达。AST编译虽通过，但所有默认装配会NameError。按tmp/llm-warmup-leak-root-before-20261104/assembly.py只恢复原class声明/层级，不回滚其它修改；检查原顶层类/函数无意外删除。
+2. **发布到start窗口没有责任flag**：_prepare_new_warmup_generation_locked发布未start的OwnedThreadTask，此时snapshot.quiet=True。第二个start/fresh能覆盖；close也会返回True，而creator尚未执行。必须按原任务加受_warmup_lock保护的start_pending，在发布时置位，start尝试finally清除；busy、snapshot.finished、wait和close都必须包含pending。start/join/HTTP仍锁外，不能只把_thread.start塞回锁内。未start owner被close cancel后，starter回来不能晚起实际模型。
+3. **closing检查必须锁内重查**：目前start/fresh只在取锁前读closing，等待锁时close后仍可发布。close在同锁内置closing并读owner/pending；start/fresh在同锁内再查。close返回True须复核同owner实际quiet且无pending；若状态变动不能假True。wait同样不能join未start就当完成。
+4. **取消迟返不能成功**：runner finally目前只按generation写ok，没有排除cancel/closing；snapshot.succeeded也未排除closing。warm_up fake/慢HTTP在取消后返回True不能使协调器允许RVC。保持fatal owner.error不被success覆盖，done唤醒也需同代且不能污染下一代。
+5. **rollback捕获错对象**：_rollback_close_llm_warmup闭包引用后面被memory包装重赋值的llm_client；应捕获固定llm_warmup_owner（默认参数或明确不可变局部），严格True且不去wrapper私有字段。
+6. **Core兼容与代码清晰**：if not self._llm_warmup_shutdown_done改getattr保守旧fixture；删除无作用_mark_llm_warmup_absent helper和if not _run_step:pass，直接赋值/直接_run_step即可。可选owner非None却不支持close不能当absent成功，保守记录未完成；默认None兼容保持。
+7. **snapshot初始/工厂失败语义**：无owner从未预热不应被描述为finished成功；factory在OS start前失败实际quiet可重试，但不能在新测试要求finishedFalse时当前实现却True。将工作结束/实际quiet/成功清楚区分，保持原never-started snapshot.finished=False，wait never-started True兼容。
+
+**新fixture暂不安全，不运行**：tests/test_ollama_warmup_lifecycle的close_join_timeout hold.wait(10)无返回校验/无entered确认，多个线程patch在close前退出；concurrent例不校验线程异常、dead、close结果，且len(owners)<=2实际允许重复，finally:pass无意义。统一<=3-5秒有界gate并断言；线程入口catch BaseException→main核验errors；finally在patch内release→实际join/assertdead→close严格True→恢复patch。新内存wrapper例close在patch外且guard/TFM返回不校验，必须收口。DI例应使用真正具有close_warmup计数方法的fake，证明未被调用，不能用本来无close方法的对象。fatal覆盖至少KBI/Exit/GeneratorExit/自定义BaseException且保留原对象。旧performance阻塞例也finally安全回收，不以wait超时自然成功代替release。
+
+仅在实际私有API迁移必需时允许你已改的tests/test_security_round3_milestone.py和tests/test_cosyvoice_production_slice_c2b2a.py，但必须审相关fixture并严格回收，不能靠扩大断言/删除失败场景使之变绿。源码/新tests修复后局部AST、diffcheck STOP；仍禁tests/gate/Root探针/报告编辑或真实模型设备/正式memory。Root准备published-before-start确定性竞态探针，随后独立验证。

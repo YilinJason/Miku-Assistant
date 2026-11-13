@@ -67,6 +67,14 @@ _RENDERERS: dict[str, Callable[[str], str]] = {
 
 def render_claim(claim: PredicateClaim) -> str:
     """由本地 claim 生成唯一规范事实正文；不得自由摘要。"""
+    if claim.render_key == "like_of_is":
+        if not claim.slot:
+            raise ValueError("like_of_is requires slot")
+        return f"用户喜欢的{claim.slot}是{claim.value}"
+    if claim.render_key == "like_most_of_is":
+        if not claim.slot:
+            raise ValueError("like_most_of_is requires slot")
+        return f"用户最喜欢的{claim.slot}是{claim.value}"
     renderer = _RENDERERS.get(claim.render_key)
     if renderer is None:
         raise ValueError(f"unknown render_key={claim.render_key!r}")
@@ -83,13 +91,34 @@ def category_for_claim(claim: PredicateClaim) -> MemoryCategory:
     return MemoryCategory.OTHER
 
 
+def _remember_prefix_gap_end(user_text: str) -> int:
+    """
+    若原文以白名单「记住」前缀开头，返回前缀及可选空白/冒号/逗号之后的下标；
+    这些字符内的边界标点不得切开事实单元。
+    """
+    from src.memory.provenance import _REMEMBER_PREFIXES
+
+    if not user_text:
+        return 0
+    for prefix in _REMEMBER_PREFIXES:
+        if user_text.startswith(prefix):
+            i = len(prefix)
+            while i < len(user_text) and user_text[i] in " \t:：,，":
+                i += 1
+            return i
+    return 0
+
+
 def _iter_boundary_segments(user_text: str) -> list[tuple[int, int, str, str]]:
     """返回 (start, end, text, terminator)；text == user_text[start:end]。"""
     if not isinstance(user_text, str) or not user_text:
         return []
     segments: list[tuple[int, int, str, str]] = []
     last = 0
+    protect_until = _remember_prefix_gap_end(user_text)
     for match in _BOUNDARY_RE.finditer(user_text):
+        if match.start() < protect_until:
+            continue
         start = last
         end = match.start()
         raw = user_text[start:end]

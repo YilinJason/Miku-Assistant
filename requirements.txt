@@ -5,13 +5,17 @@
 pyyaml>=6.0.1
 requests>=2.31.0
 
-edge-tts>=6.1.0
+edge-tts>=7.3.1
 librosa>=0.10.0
 soundfile>=0.12.0
 numpy>=1.24.0
 scipy>=1.11.0
 
+# Silero CPU ONNX VAD (pinned stack; see requirements-input-audio.txt)
+-r requirements-input-audio.txt
+
 SpeechRecognition>=3.10.0
 pyaudio>=0.2.14
+webrtcvad-wheels==2.0.14.post1
 
 pygame>=2.5.0

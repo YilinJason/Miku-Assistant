@@ -68,7 +68,11 @@ class AudioPlayer:
         if not os.path.exists(audio_file):
             raise FileNotFoundError(f"音频文件不存在: {audio_file}")
 
-        self.logger.debug("播放音频文件: %s", audio_file)
+        self.logger.debug(
+            "播放音频文件 has_path=%s backend=%s",
+            bool(audio_file),
+            self._backend,
+        )
         if self._stop_event.is_set():
             return
 

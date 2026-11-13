@@ -14,6 +14,8 @@ STT/TTS/AudioPlayer/RVC；``voice`` 同步构造；Ollama/RVC 预热按资源配
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -22,12 +24,25 @@ from typing import Any, Callable, List, Optional, Tuple
 from src.core.config import Config
 from src.core.file_cleaner import FileCleaner
 from src.core.logging_setup import setup_app_logging
-from src.core.paths import RUNTIME_DATA_DIRS, ensure_runtime_dirs, runtime_layout_summary
-from src.core.resource_coord import run_coordinated_warmup
+from src.core.paths import PROJECT_ROOT, RUNTIME_DATA_DIRS, ensure_runtime_dirs
+from src.core.companion import (
+    CompanionSettings,
+    build_companion_base_system,
+    parse_companion_settings,
+)
+from src.core.resource_coord import run_coordinated_warmup, start_ollama_warmup
 from src.core.resource_settings import ResourceSettings, parse_resource_settings
 from src.core.router import IntentRouter
 from src.core.router_factory import build_intent_router
-from src.core.safety import SafetyPolicy
+from src.core.safety import (
+    Operation,
+    SafetyPolicy,
+    TrustedLocalAsrProfile,
+    TrustedLocalTtsProfile,
+    TrustedRvcProfile,
+    _require_bool,
+)
+from src.core.network_endpoint import authorize_model_endpoint, endpoint_audit_label
 from src.core.startup_mode import (
     StartupMode,
     normalize_startup_mode,
@@ -38,8 +53,44 @@ from src.llm.ollama_client import OllamaClient
 from src.memory.runtime import MemoryRuntime, parse_memory_settings
 from src.search.chrome_search import ChromeSearcher
 from src.system.windows_control import WindowsController
-from src.voice.stt import STTEngine
-from src.voice.tts import TTSEngine
+from src.voice.audio.temp_files import TempFileManager
+
+
+def default_tts_engine_cls(**kwargs: Any) -> Any:
+    """窄默认工厂：仅在调用时导入 ``TTSEngine`` 并构造实例。"""
+    from src.voice.tts.engine import TTSEngine
+
+    return TTSEngine(**kwargs)
+
+
+def default_stt_engine_cls(**kwargs: Any) -> Any:
+    """窄默认工厂：仅在调用时导入 ``STTEngine`` 并构造实例。"""
+    from src.voice.stt import STTEngine
+
+    return STTEngine(**kwargs)
+
+
+_LAZY_MODULE_EXPORTS: dict[str, tuple[str, str]] = {
+    "TTSEngine": ("src.voice.tts.engine", "TTSEngine"),
+    "STTEngine": ("src.voice.stt", "STTEngine"),
+}
+
+
+def __getattr__(name: str) -> object:
+    spec = _LAZY_MODULE_EXPORTS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = spec
+    import importlib
+
+    module = importlib.import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_MODULE_EXPORTS))
 
 
 @dataclass
@@ -61,9 +112,21 @@ class AssembledParts:
     memory_runtime: Optional[Any] = None
     startup_mode: StartupMode = "interactive"
     resource_settings: Optional[ResourceSettings] = None
+    companion_settings: Optional[CompanionSettings] = None
     voice_autoload_enabled: bool = False
+    temp_file_manager: Optional[TempFileManager] = None
     tts_engine_cls: Optional[Callable[..., Any]] = field(default=None, repr=False)
     stt_engine_cls: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    model_memory_admission: Optional[Any] = None
+    llm_warmup_owner: Optional[Any] = None
+
+
+def _type_declares_close_warmup(cls: type) -> bool:
+    """仅类型 MRO 上显式声明的 ``close_warmup``；不用实例 getattr 探测 Mock。"""
+    for klass in cls.__mro__:
+        if "close_warmup" in klass.__dict__:
+            return callable(klass.__dict__["close_warmup"])
+    return False
 
 
 class _RollbackRegistry:
@@ -88,12 +151,26 @@ class _RollbackRegistry:
             try:
                 action()
             except Exception as exc:
+                from src.core.log_privacy import exception_log_label
+
                 self._logger.error(
-                    "装配回滚失败 resource=%s error=%s",
+                    "装配回滚失败 resource=%s err=%s",
                     name,
-                    exc,
+                    exception_log_label(exc),
                     exc_info=True,
                 )
+
+
+def _callable_accepts_kw(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    if name in sig.parameters:
+        return True
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
 
 
 def _callable_accepts_stop_rvc(shutdown: Callable[..., Any]) -> bool:
@@ -108,6 +185,157 @@ def _callable_accepts_stop_rvc(shutdown: Callable[..., Any]) -> bool:
     return any(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
     )
+
+
+def _voice_tts_engine_name(config: Any) -> str:
+    tts_cfg = config.get("voice.tts", {}) or {}
+    return str(tts_cfg.get("engine", "edge-tts"))
+
+
+def _voice_stt_engine_name(config: Any) -> str:
+    stt_cfg = _coerce_voice_stt_mapping(config)
+    return str(stt_cfg.get("engine", "paraformer"))
+
+
+def _coerce_voice_stt_mapping(config: Any) -> dict[str, Any]:
+    """``voice.stt`` 缺省为 ``{}``；``None`` 与缺键等价；其它错误形状显式失败。"""
+    raw = config.get("voice.stt", None)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("voice.stt must be a mapping")
+    return raw
+
+
+def validate_assembly_voice_stt_config(config: Any) -> None:
+    """在装配副作用前校验 ``voice.stt``（含 paraformer 内层与 input_audio）。"""
+    stt_cfg = _coerce_voice_stt_mapping(config)
+    from src.voice.input_audio import resolve_input_audio_settings_from_stt_config
+
+    resolve_input_audio_settings_from_stt_config(stt_cfg)
+    engine = _voice_stt_engine_name(config)
+    if engine != "paraformer":
+        return
+    from src.voice.paraformer.settings import resolve_paraformer_settings_from_stt_config
+
+    resolve_paraformer_settings_from_stt_config(stt_cfg)
+    security = config.get("security", {}) or {}
+    perms = security.get("permissions") or {}
+    if "local_asr_worker" in perms:
+        _require_bool("security.permissions.local_asr_worker", perms["local_asr_worker"])
+
+
+def _local_asr_worker_enabled_for_assembly(config: Any) -> bool:
+    security = config.get("security", {}) or {}
+    perms = security.get("permissions") or {}
+    if "local_asr_worker" not in perms:
+        return False
+    return bool(perms["local_asr_worker"])
+
+
+def validate_assembly_voice_tts_config(config: Any) -> None:
+    """
+    在日志/目录/TFM 等装配副作用之前校验 ``voice.tts``。
+
+    选定 ``cosyvoice`` 时严格解析内层 ``voice.tts.cosyvoice``；
+    ``local_tts_worker`` 若出现则必须是 bool。
+    """
+    engine = _voice_tts_engine_name(config)
+    if engine != "cosyvoice":
+        return
+    tts_cfg = config.get("voice.tts", {}) or {}
+    inner = tts_cfg.get("cosyvoice")
+    if inner is not None and not isinstance(inner, dict):
+        raise ValueError("voice.tts.cosyvoice must be a mapping when engine is cosyvoice")
+    from src.voice.tts.cosyvoice_backend import (
+        resolve_cosyvoice_settings_from_engine_config,
+    )
+
+    resolve_cosyvoice_settings_from_engine_config(inner)
+    security = config.get("security", {}) or {}
+    perms = security.get("permissions") or {}
+    if "local_tts_worker" in perms:
+        _require_bool("security.permissions.local_tts_worker", perms["local_tts_worker"])
+
+
+def _local_tts_worker_enabled_for_assembly(config: Any) -> bool:
+    """与 ``SafetyPolicy.from_app_config`` 缺省一致：仅显式 true 才尝试封存本地 TTS。"""
+    security = config.get("security", {}) or {}
+    perms = security.get("permissions") or {}
+    if "local_tts_worker" not in perms:
+        return False
+    return bool(perms["local_tts_worker"])
+
+
+def _try_trusted_asr_profile_for_config(config: Any) -> Optional[TrustedLocalAsrProfile]:
+    """若固定布局可用则返回 ASR profile；缺失资产时返回 None（不阻塞 text 启动）。"""
+    if _voice_stt_engine_name(config) != "paraformer":
+        return None
+    if not _local_asr_worker_enabled_for_assembly(config):
+        return None
+    from src.voice.paraformer.assets import revalidate_fixed_layout_paths
+
+    try:
+        revalidate_fixed_layout_paths(PROJECT_ROOT)
+    except PermissionError:
+        return None
+    return TrustedLocalAsrProfile(repo_root=PROJECT_ROOT)
+
+
+def build_assembly_safety_policy(
+    config: Any,
+    *,
+    trusted_rvc: Optional[TrustedRvcProfile] = None,
+    startup_mode: Optional[Any] = None,
+    logger: Optional[logging.Logger] = None,
+) -> SafetyPolicy:
+    """
+    构造装配期共享 ``SafetyPolicy``。
+
+    CosyVoice TTS profile 与历史一致：``engine=cosyvoice`` 且权限开启时在构造期尝试封存。
+    Paraformer ASR profile 在固定布局存在时同样于构造期封存（与 startup_mode 无关）；
+    布局缺失时仅省略 ASR profile，text/interactive 仍可用；安装资产后需重启助手。
+    """
+    log = logger or logging.getLogger(__name__)
+    trusted_local: Optional[TrustedLocalTtsProfile] = None
+    trusted_asr: Optional[TrustedLocalAsrProfile] = None
+    if _voice_tts_engine_name(config) == "cosyvoice" and _local_tts_worker_enabled_for_assembly(
+        config
+    ):
+        trusted_local = TrustedLocalTtsProfile(repo_root=PROJECT_ROOT)
+    trusted_asr = _try_trusted_asr_profile_for_config(config)
+    try:
+        return SafetyPolicy.from_app_config(
+            config,
+            trusted_rvc_profile=trusted_rvc,
+            trusted_local_tts_profile=trusted_local,
+            trusted_local_asr_profile=trusted_asr,
+        )
+    except PermissionError:
+        if trusted_asr is not None and trusted_local is not None:
+            log.debug(
+                "装配 ASR+TTS profile 组合封存失败，回退仅 TTS tag=local_asr_profile_seal_fallback"
+            )
+            try:
+                return SafetyPolicy.from_app_config(
+                    config,
+                    trusted_rvc_profile=trusted_rvc,
+                    trusted_local_tts_profile=trusted_local,
+                    trusted_local_asr_profile=None,
+                )
+            except PermissionError:
+                pass
+        if trusted_local is None and trusted_asr is None:
+            raise
+        log.debug(
+            "装配本地语音 profile 封存跳过 tag=local_voice_profile_seal_fallback"
+        )
+        return SafetyPolicy.from_app_config(
+            config,
+            trusted_rvc_profile=trusted_rvc,
+            trusted_local_tts_profile=None,
+            trusted_local_asr_profile=None,
+        )
 
 
 def _shutdown_engine(engine: Any, *, stop_rvc: bool = True) -> None:
@@ -133,50 +361,118 @@ def _shutdown_engine(engine: Any, *, stop_rvc: bool = True) -> None:
         )
 
 
+def _register_stt_engine_rollback(
+    rollback: _RollbackRegistry,
+    stt_engine: Any,
+    *,
+    logger: logging.Logger,
+) -> None:
+    """仅登记显式 ``shutdown``；遗留无资源适配器可省略。Paraformer 须报告 complete。"""
+    shutdown = getattr(stt_engine, "shutdown", None)
+    if not callable(shutdown):
+        return
+    engine_ref = stt_engine
+
+    def _rollback_stt() -> None:
+        from src.core.log_privacy import exception_log_label
+        from src.core.voice_activation import stt_shutdown_reports_complete
+
+        try:
+            if _callable_accepts_stop_rvc(shutdown):
+                result = shutdown(stop_rvc=False)
+            else:
+                result = shutdown()
+        except Exception as exc:
+            logger.error(
+                "装配回滚 STT shutdown 失败 err=%s",
+                exception_log_label(exc),
+                exc_info=True,
+            )
+            return
+        if getattr(engine_ref, "engine_type", None) == "paraformer":
+            if result is not True or not stt_shutdown_reports_complete(engine_ref):
+                logger.error(
+                    "装配回滚 Paraformer STT shutdown 未 complete tag=stt_rollback_incomplete"
+                )
+
+    rollback.register("stt_engine.shutdown", _rollback_stt)
+
+
 def build_tts_engine(
     config: Any,
     safety_policy: SafetyPolicy,
     *,
-    tts_engine_cls: Callable[..., Any] = TTSEngine,
+    tts_engine_cls: Callable[..., Any] = default_tts_engine_cls,
     warm_rvc_on_init: bool = False,
+    temp_file_manager: Optional[TempFileManager] = None,
 ) -> Any:
     """仅构造 TTS（含可选 AudioPlayer/RVC 绑定），不预热 Worker。"""
     tts_config = config.get("voice.tts", {}) or {}
-    return tts_engine_cls(
-        engine=tts_config.get("engine", "edge-tts"),
-        language=tts_config.get("language", "zh-CN"),
-        rate=tts_config.get("rate", 150),
-        volume=tts_config.get("volume", 0.8),
-        voice=tts_config.get("voice", "zh-CN-XiaoxiaoNeural"),
-        rvc_config=config.get_rvc_config() if hasattr(config, "get_rvc_config") else None,
-        fallback_enabled=tts_config.get("fallback_enabled", True),
-        fallback_engine=tts_config.get("fallback_engine", "pyttsx3"),
-        pipeline_enabled=tts_config.get("pipeline_enabled", True),
-        safety_policy=safety_policy,
-        warm_rvc_on_init=warm_rvc_on_init,
-    )
+    engine = tts_config.get("engine", "edge-tts")
+    kwargs: dict[str, Any] = {
+        "engine": engine,
+        "language": tts_config.get("language", "zh-CN"),
+        "rate": tts_config.get("rate", 150),
+        "volume": tts_config.get("volume", 0.8),
+        "voice": tts_config.get("voice", "zh-CN-XiaoxiaoNeural"),
+        "rvc_config": config.get_rvc_config() if hasattr(config, "get_rvc_config") else None,
+        "fallback_enabled": tts_config.get("fallback_enabled", True),
+        "fallback_engine": tts_config.get("fallback_engine", "pyttsx3"),
+        "pipeline_enabled": tts_config.get("pipeline_enabled", True),
+        "safety_policy": safety_policy,
+        "temp_file_manager": temp_file_manager,
+        "warm_rvc_on_init": warm_rvc_on_init,
+        "edge_prosody": tts_config.get("edge_prosody"),
+    }
+    if engine == "cosyvoice":
+        kwargs["cosyvoice_config"] = tts_config.get("cosyvoice")
+    return tts_engine_cls(**kwargs)
 
 
 def build_stt_engine(
     config: Any,
     *,
-    stt_engine_cls: Callable[..., Any] = STTEngine,
+    stt_engine_cls: Callable[..., Any] = default_stt_engine_cls,
+    safety_policy: Optional[SafetyPolicy] = None,
+    temp_file_manager: Optional[TempFileManager] = None,
 ) -> Any:
-    stt_config = config.get("voice.stt", {}) or {}
-    return stt_engine_cls(
-        engine=stt_config.get("engine", "speech_recognition"),
-        language=stt_config.get("language", "zh-CN"),
-        energy_threshold=stt_config.get("energy_threshold", 4000),
+    from src.voice.input_audio import (
+        resolve_input_audio_settings_from_stt_config,
+        validate_stt_energy_threshold_value,
     )
+
+    stt_config = _coerce_voice_stt_mapping(config)
+    engine = stt_config.get("engine", "paraformer")
+    kwargs: dict[str, Any] = {
+        "engine": engine,
+        "language": stt_config.get("language", "zh-CN"),
+        "energy_threshold": validate_stt_energy_threshold_value(
+            stt_config.get("energy_threshold", 4000)
+        ),
+        "safety_policy": safety_policy,
+        "temp_file_manager": temp_file_manager,
+    }
+    if engine == "paraformer":
+        from src.voice.paraformer.settings import resolve_paraformer_settings_from_stt_config
+
+        kwargs["paraformer_settings"] = resolve_paraformer_settings_from_stt_config(
+            stt_config
+        )
+
+    kwargs["input_audio_settings"] = resolve_input_audio_settings_from_stt_config(
+        stt_config
+    )
+    return stt_engine_cls(**kwargs)
 
 
 def build_voice_engines(
     config: Any,
     safety_policy: SafetyPolicy,
     *,
-    tts_engine_cls: Callable[..., Any] = TTSEngine,
-    stt_engine_cls: Callable[..., Any] = STTEngine,
+    tts_engine_cls: Callable[..., Any] = default_tts_engine_cls,
+    stt_engine_cls: Callable[..., Any] = default_stt_engine_cls,
     warm_rvc_on_init: bool = False,
+    temp_file_manager: Optional[TempFileManager] = None,
 ) -> Tuple[Any, Any]:
     """
     构造 TTS/STT；默认不在构造期预热 RVC。
@@ -188,9 +484,15 @@ def build_voice_engines(
         safety_policy,
         tts_engine_cls=tts_engine_cls,
         warm_rvc_on_init=warm_rvc_on_init,
+        temp_file_manager=temp_file_manager,
     )
     try:
-        stt_engine = build_stt_engine(config, stt_engine_cls=stt_engine_cls)
+        stt_engine = build_stt_engine(
+            config,
+            stt_engine_cls=stt_engine_cls,
+            safety_policy=safety_policy,
+            temp_file_manager=temp_file_manager,
+        )
     except Exception:
         _shutdown_engine(tts_engine)
         raise
@@ -205,8 +507,8 @@ def assemble_default(
     logging_setup: Optional[Callable[[Any], Any]] = None,
     dir_preparer: Optional[Callable[[], None]] = None,
     ollama_client_cls: Callable[..., Any] = OllamaClient,
-    tts_engine_cls: Callable[..., Any] = TTSEngine,
-    stt_engine_cls: Callable[..., Any] = STTEngine,
+    tts_engine_cls: Callable[..., Any] = default_tts_engine_cls,
+    stt_engine_cls: Callable[..., Any] = default_stt_engine_cls,
     windows_controller_cls: Callable[..., Any] = WindowsController,
     chrome_searcher_cls: Callable[..., Any] = ChromeSearcher,
     character_interface_cls: Callable[..., Any] = CharacterInterface,
@@ -234,12 +536,45 @@ def assemble_default(
     build_router = router_builder or build_intent_router
 
     config = load_config(config_path)
-    safety_policy = SafetyPolicy.from_app_config(config)
 
-    # memory / resource 配置在任何设备工厂之前校验；未启用则零开销
+    validate_assembly_voice_tts_config(config)
+    validate_assembly_voice_stt_config(config)
+
+    # 装配边界：构造前解析受信 RVC profile；无模型则保持未封存并安全拒绝
+    trusted_rvc = None
+    try:
+        from src.voice.rvc.infer import resolve_rvc_python
+
+        rvc_cfg = (
+            config.get_rvc_config() if hasattr(config, "get_rvc_config") else {}
+        ) or {}
+        python = resolve_rvc_python(rvc_cfg)
+        model = rvc_cfg.get("model_path")
+        if model and Path(model).is_file() and python.is_file():
+            index = rvc_cfg.get("index_path")
+            trusted_rvc = TrustedRvcProfile(
+                python_path=python,
+                model_path=model,
+                index_path=index if index and Path(index).is_file() else None,
+            )
+    except Exception:
+        # 解析失败时保持未封存；正式策略创建后不可再补封
+        trusted_rvc = None
+
+    assembly_logger = logging.getLogger("src.core.assembly")
+    safety_policy = build_assembly_safety_policy(
+        config,
+        trusted_rvc=trusted_rvc,
+        startup_mode=mode,
+        logger=assembly_logger,
+    )
+
+    # memory / resource / companion 配置在任何设备工厂之前校验；未启用则零开销
     memory_settings = parse_memory_settings(config)
     memory_enabled = memory_settings.enabled
     resource_settings = parse_resource_settings(config)
+    companion_settings = parse_companion_settings(config)
+    companion_base_system = build_companion_base_system(companion_settings)
 
     log_file = setup_logging(config)
 
@@ -247,8 +582,13 @@ def assemble_default(
     for directory in RUNTIME_DATA_DIRS:
         safety_policy.register_file_delete_dir(directory)
 
-    logger = logging.getLogger("src.core.assembly")
-    logger.info(runtime_layout_summary())
+    logger = assembly_logger
+    if trusted_rvc is None:
+        logger.debug("未封存 RVC profile（无模型或解析失败），相关能力将 fail closed")
+
+    temp_file_manager = TempFileManager(safety_policy=safety_policy)
+
+    logger.info("运行时数据目录已就绪 dirs=logs,tmp,test")
     logger.info(
         "装配启动模式=%s voice_at_assemble=%s resource.profile=%s",
         mode,
@@ -256,10 +596,18 @@ def assemble_default(
         resource_settings.profile,
     )
     if log_file:
-        logger.info("崩溃排查请查看日志文件: %s", log_file)
-    logger.debug("安全策略: %s", safety_policy.summary())
+        # 仅记相对文件名，不落绝对路径
+        logger.info(
+            "崩溃排查请查看日志文件 name=%s",
+            Path(log_file).name if hasattr(log_file, "name") else "miku.log",
+        )
+    logger.debug(
+        "安全策略权限摘要 keys=%s",
+        len(safety_policy.summary()),
+    )
 
     rollback = _RollbackRegistry(logger)
+    rollback.register("temp_file_manager.shutdown", temp_file_manager.shutdown)
     memory_runtime = None
     tts_engine = None
     stt_engine = None
@@ -277,18 +625,90 @@ def assemble_default(
                 "ollama.history.max_stored_turns", DEFAULT_MAX_STORED_TURNS
             ),
         )
-        llm_client = ollama_client_cls(
-            base_url=config.get("ollama.base_url"),
-            model=config.get("ollama.model"),
-            timeout=config.get("ollama.timeout"),
-            keep_alive=config.get("ollama.keep_alive", "30m"),
-            max_stored_turns=max_stored_turns,
+        # 模型端点在任何 HTTP/设备/线程前封存；无策略旁路仅 loopback
+        ollama_url = config.get("ollama.base_url", "http://localhost:11434")
+        sealed_ollama = authorize_model_endpoint(
+            safety_policy, ollama_url, context="assemble_ollama"
         )
+        from src.core.model_memory_admission import LocalModelMemoryAdmission
+
+        model_memory_guard = LocalModelMemoryAdmission(
+            sealed_ollama, safety_policy=safety_policy
+        )
+        rollback.register(
+            "model_memory_admission.close", model_memory_guard.close
+        )
+        ollama_kwargs: dict[str, Any] = {
+            "base_url": sealed_ollama.base_url,
+            "model": config.get("ollama.model"),
+            "timeout": config.get("ollama.timeout"),
+            "keep_alive": config.get("ollama.keep_alive", "30m"),
+            "max_stored_turns": max_stored_turns,
+        }
+        if _callable_accepts_kw(ollama_client_cls, "safety_policy"):
+            ollama_kwargs["safety_policy"] = safety_policy
+        if _callable_accepts_kw(ollama_client_cls, "sealed_endpoint"):
+            ollama_kwargs["sealed_endpoint"] = sealed_ollama
+        if _callable_accepts_kw(ollama_client_cls, "foreground_warmup_wait_sec"):
+            ollama_kwargs["foreground_warmup_wait_sec"] = (
+                resource_settings.foreground_warmup_wait_sec
+            )
+        if (
+            companion_base_system is not None
+            and _callable_accepts_kw(ollama_client_cls, "base_system")
+        ):
+            ollama_kwargs["base_system"] = companion_base_system
+        if _callable_accepts_kw(ollama_client_cls, "model_memory_guard"):
+            ollama_kwargs["model_memory_guard"] = model_memory_guard
+        llm_client = ollama_client_cls(**ollama_kwargs)
+        llm_warmup_owner: Optional[Any] = None
+        if _type_declares_close_warmup(type(llm_client)):
+            llm_warmup_owner = llm_client
+
+            def _rollback_close_llm_warmup(
+                _owner: Any = llm_warmup_owner,
+            ) -> None:
+                if _owner.close_warmup(timeout=2.0) is not True:
+                    raise RuntimeError("llm_warmup_owner.close_warmup incomplete")
+
+            rollback.register(
+                "llm_warmup_owner.close_warmup", _rollback_close_llm_warmup
+            )
         logger.info("LLM 模块初始化成功")
 
+        tts_cfg = config.get("voice.tts", {}) or {}
+        stt_cfg = config.get("voice.stt", {}) or {}
+        logger.info(
+            "网络出口摘要 endpoint_kind=%s remote_model=%s insecure_http=%s "
+            "cloud_stt=%s cloud_tts=%s stt_engine=%s tts_engine=%s voice_at_assemble=%s",
+            endpoint_audit_label(sealed_ollama),
+            safety_policy.is_allowed(Operation.REMOTE_MODEL_ENDPOINT),
+            safety_policy.is_allowed(Operation.INSECURE_REMOTE_MODEL_HTTP),
+            safety_policy.is_allowed(Operation.CLOUD_STT),
+            safety_policy.is_allowed(Operation.CLOUD_TTS),
+            stt_cfg.get("engine", "paraformer"),
+            tts_cfg.get("engine", "edge-tts"),
+            voice_stack_at_assemble(mode),
+        )
+
         if memory_enabled:
+            # extractor 显式 override 独立授权；null 继承已封存主 Ollama URL
+            raw_ext = config.get("memory.extractor.base_url")
+            if raw_ext is None or raw_ext == "":
+                sealed_extractor = sealed_ollama
+            else:
+                sealed_extractor = authorize_model_endpoint(
+                    safety_policy, raw_ext, context="assemble_memory_extractor"
+                )
             make_runtime = memory_runtime_factory or MemoryRuntime.create_from_settings
-            memory_runtime = make_runtime(memory_settings, logger=logger)
+            runtime_kwargs: dict[str, Any] = {"logger": logger}
+            if _callable_accepts_kw(make_runtime, "safety_policy"):
+                runtime_kwargs["safety_policy"] = safety_policy
+            if _callable_accepts_kw(make_runtime, "sealed_endpoint"):
+                runtime_kwargs["sealed_endpoint"] = sealed_extractor
+            if _callable_accepts_kw(make_runtime, "model_memory_guard"):
+                runtime_kwargs["model_memory_guard"] = model_memory_guard
+            memory_runtime = make_runtime(memory_settings, **runtime_kwargs)
             rollback.register("memory_runtime.close", memory_runtime.close)
             llm_client = memory_runtime.wrap_llm(llm_client)
             memory_runtime.start()
@@ -308,33 +728,17 @@ def assemble_default(
 
         if voice_stack_at_assemble(mode):
             # 构造期不预热 RVC；交由串行协调器，避免与 Ollama 并行抢 GPU
-            tts_config = config.get("voice.tts", {}) or {}
-            tts_engine = tts_engine_cls(
-                engine=tts_config.get("engine", "edge-tts"),
-                language=tts_config.get("language", "zh-CN"),
-                rate=tts_config.get("rate", 150),
-                volume=tts_config.get("volume", 0.8),
-                voice=tts_config.get("voice", "zh-CN-XiaoxiaoNeural"),
-                rvc_config=(
-                    config.get_rvc_config()
-                    if hasattr(config, "get_rvc_config")
-                    else None
-                ),
-                fallback_enabled=tts_config.get("fallback_enabled", True),
-                fallback_engine=tts_config.get("fallback_engine", "pyttsx3"),
-                pipeline_enabled=tts_config.get("pipeline_enabled", True),
-                safety_policy=safety_policy,
+            tts_engine, stt_engine = build_voice_engines(
+                config,
+                safety_policy,
+                tts_engine_cls=tts_engine_cls,
+                stt_engine_cls=stt_engine_cls,
                 warm_rvc_on_init=False,
+                temp_file_manager=temp_file_manager,
             )
             rollback.register("tts_engine.shutdown", tts_engine.shutdown)
+            _register_stt_engine_rollback(rollback, stt_engine, logger=logger)
             logger.info("TTS 模块初始化成功（voice 模式）")
-
-            stt_config = config.get("voice.stt", {}) or {}
-            stt_engine = stt_engine_cls(
-                engine=stt_config.get("engine", "speech_recognition"),
-                language=stt_config.get("language", "zh-CN"),
-                energy_threshold=stt_config.get("energy_threshold", 4000),
-            )
             logger.info("STT 模块初始化成功（voice 模式）")
         else:
             logger.info(
@@ -385,14 +789,46 @@ def assemble_default(
             safety_policy=safety_policy,
         )
 
-        # text：仅 Ollama；voice：串行 Ollama↔RVC；interactive 延迟到懒加载
-        run_coordinated_warmup(
-            llm_client=llm_client,
-            tts_engine=tts_engine,
-            settings=resource_settings,
-            log=logger,
-            events=warmup_events,
-        )
+        # text：仅 Ollama；voice Edge+RVC：装配期 defer RVC；Cosy：App ensure
+        engine_name = _voice_tts_engine_name(config)
+        if engine_name == "cosyvoice":
+            logger.info(
+                "CosyVoice 装配期零模型预热（App ensure 再 prepare_local_voice）"
+            )
+        elif (
+            tts_engine is not None
+            and voice_stack_at_assemble(mode)
+        ):
+            from src.core.voice_activation import edge_rvc_warmup_required
+
+            if edge_rvc_warmup_required(tts_engine, resource_settings):
+                started = start_ollama_warmup(
+                    llm_client,
+                    settings=resource_settings,
+                    log=logger,
+                )
+                if warmup_events is not None:
+                    warmup_events.append("ollama_start" if started else "ollama_skip")
+                    warmup_events.append("rvc_deferred_app_foreground")
+                logger.info(
+                    "voice 装配期 defer RVC 预热；App request 再串行 Ollama→RVC"
+                )
+            else:
+                run_coordinated_warmup(
+                    llm_client=llm_client,
+                    tts_engine=tts_engine,
+                    settings=resource_settings,
+                    log=logger,
+                    events=warmup_events,
+                )
+        elif tts_engine is None or engine_name != "cosyvoice":
+            run_coordinated_warmup(
+                llm_client=llm_client,
+                tts_engine=tts_engine,
+                settings=resource_settings,
+                log=logger,
+                events=warmup_events,
+            )
 
         parts = AssembledParts(
             config=config,
@@ -410,9 +846,13 @@ def assemble_default(
             memory_runtime=memory_runtime,
             startup_mode=mode,
             resource_settings=resource_settings,
+            companion_settings=companion_settings,
             voice_autoload_enabled=not voice_stack_at_assemble(mode),
+            temp_file_manager=temp_file_manager,
             tts_engine_cls=tts_engine_cls,
             stt_engine_cls=stt_engine_cls,
+            model_memory_admission=model_memory_guard,
+            llm_warmup_owner=llm_warmup_owner,
         )
         rollback.abandon()
         return parts
@@ -441,7 +881,13 @@ def _create_file_cleaner(
     try:
         file_cleaner = cleaner_factory(config, safety_policy=safety_policy)
     except Exception as exc:
-        logger.error("文件清理器构造失败: %s", exc, exc_info=True)
+        from src.core.log_privacy import exception_log_label
+
+        logger.error(
+            "文件清理器构造失败 err=%s",
+            exception_log_label(exc),
+            exc_info=True,
+        )
         return None
 
     if file_cleaner is None:
@@ -459,15 +905,21 @@ def _create_file_cleaner(
     try:
         file_cleaner.start_auto_cleanup()
     except Exception as start_exc:
-        logger.error("文件清理器启动失败: %s", start_exc, exc_info=True)
+        from src.core.log_privacy import exception_log_label
+
+        logger.error(
+            "文件清理器启动失败 err=%s",
+            exception_log_label(start_exc),
+            exc_info=True,
+        )
         # 阶段一：立即尝试停止（与致命失败回滚分开计数）
         try:
             file_cleaner.stop_auto_cleanup()
         except Exception as stop_exc:
             logger.error(
                 "文件清理器启动失败且立即 stop_auto_cleanup 也失败，"
-                "保留引用并由致命失败回滚再尝试一次 / 或交助手 shutdown: %s",
-                stop_exc,
+                "保留引用并由致命失败回滚再尝试一次 / 或交助手 shutdown err=%s",
+                exception_log_label(stop_exc),
                 exc_info=True,
             )
             rollback.register(

@@ -20,6 +20,7 @@ class GenerateStatus(Enum):
     TIMEOUT = "timeout"
     HTTP_ERROR = "http_error"
     RESPONSE_ERROR = "response_error"  # 解析失败、结构错误、非字符串正文等
+    RESOURCE_ERROR = "resource_error"  # 本机模型内存准入拒绝（非连接失败）
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,8 @@ class GenerateResult:
         if self.status is GenerateStatus.EMPTY:
             return ""
         detail = self.error_detail or ""
+        if self.status is GenerateStatus.RESOURCE_ERROR:
+            return f"错误: {detail}"
         if self.status in (
             GenerateStatus.CONNECTION_ERROR,
             GenerateStatus.TIMEOUT,

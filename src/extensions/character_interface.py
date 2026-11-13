@@ -49,7 +49,9 @@ class CharacterInterface:
             self._initialized = True
 
         except Exception as e:
-            self.logger.error(f"角色模型初始化失败: {e}")
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.error("角色模型初始化失败 err=%s", exception_log_label(e))
             self._initialized = False
 
     def send_message(self, message: str, audio_file: Optional[str] = None) -> bool:
@@ -68,16 +70,22 @@ class CharacterInterface:
             return False
 
         try:
+            msg_chars = len(message or "")
+            has_audio = bool(audio_file)
             if self.model_type == "unity":
-                self.logger.info(f"发送消息到Unity: {message}")
-                if audio_file:
-                    self.logger.info(f"同时发送音频文件: {audio_file}")
+                self.logger.info(
+                    "发送消息到Unity chars=%d has_audio=%s",
+                    msg_chars,
+                    has_audio,
+                )
                 return True
 
             elif self.model_type == "other":
-                self.logger.info(f"发送消息到角色模型: {message}")
-                if audio_file:
-                    self.logger.info(f"同时发送音频文件: {audio_file}")
+                self.logger.info(
+                    "发送消息到角色模型 chars=%d has_audio=%s",
+                    msg_chars,
+                    has_audio,
+                )
                 return True
 
             else:
@@ -85,7 +93,9 @@ class CharacterInterface:
                 return False
 
         except Exception as e:
-            self.logger.error(f"发送消息失败: {e}")
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.error("发送消息失败 err=%s", exception_log_label(e))
             return False
 
     def close(self) -> None:
@@ -94,6 +104,8 @@ class CharacterInterface:
             try:
                 self.logger.info("角色模型接口已关闭")
             except Exception as e:
-                self.logger.error(f"关闭接口失败: {e}")
+                from src.core.log_privacy import exception_log_label
+
+                self.logger.error("关闭接口失败 err=%s", exception_log_label(e))
             finally:
                 self._initialized = False

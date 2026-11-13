@@ -54,8 +54,12 @@ class VoiceInputGateTests(unittest.TestCase):
                 output_active=True,
             ).accepted
         )
-        # 门控只在输出期间变严格；空闲时保留既有识别行为。
+        # 门控在输出期间过滤回声；空闲时仍接受语气词，但丢弃单字噪声。
         self.assertTrue(gate.evaluate("嗯", output_active=False).accepted)
+        self.assertEqual(
+            gate.evaluate("呀", output_active=False).decision,
+            InputGateDecision.TOO_SHORT,
+        )
 
 
 class _Config:

@@ -1,0 +1,7 @@
+# 离线安全测试隔离硬件负载（仅测试）
+
+TFM生产Root加强异常2、bounds9、claims5已独立PASS（tfm_last_*_20261104l）；最终相关组中旧tests.test_security_round3a的test_infer_subprocess_uses_dedicated_not_generic失败，实际在fake能力runner前被host_memory_commit_insufficient拒绝。该模块漏迁移host-memory fixture，review_fixes模块已使用setUpModule install_module_sufficient_host_memory。不能靠关闭用户应用、等空闲内存或放松生产准入来通过离线测试。
+
+请只改tests/test_security_round3a.py，沿用tests/support/host_memory_fixtures.py的unittest.enterModuleContext有界module fixture，setUpModule显式安装，模块结束自动恢复，禁止import时永久patch。保持权限/原失败断言/生产逻辑/预算/Root探针监督器不变，无真实模型设备/正式memory/提交推送。先监督器新label单模块+review_fixes相关组<=120秒，失败停，写handoff真实JSON后STOP。不重复未改生产模块或开启下一开发板块。
+
+旧Root tmp/codex_persistent_rvc_boundary_2026_11_03.py同样构造fake CPU client前漏内存facts，Root已自行补仅构造作用域的Enough decision，不是Cursor可改Root授权，后续由Root重跑。

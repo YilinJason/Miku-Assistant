@@ -244,9 +244,8 @@ class TempFileManagerBoundsTests(unittest.TestCase):
             policy = SafetyPolicy()
             policy.register_file_delete_dir(root)
             mgr = TempFileManager(safety_policy=policy, delayed_queue_capacity=4)
-            path = root / "miku_long.wav"
-            path.write_text("x", encoding="utf-8")
-            mgr.remove_delayed(str(path), delay=30.0, max_retries=5)
+            path = mgr.create(".wav", directory=root)
+            mgr.remove_delayed(path, delay=30.0, max_retries=5)
             time.sleep(0.05)
             self.assertTrue(
                 any(
@@ -270,17 +269,15 @@ class TempFileManagerBoundsTests(unittest.TestCase):
             policy.register_file_delete_dir(root)
             mgr = TempFileManager(safety_policy=policy, delayed_queue_capacity=2)
             # 阻塞 worker：先塞一个超长 delay
-            p0 = root / "miku_block.wav"
-            p0.write_text("x", encoding="utf-8")
-            mgr.remove_delayed(str(p0), delay=30.0, max_retries=1)
+            p0 = mgr.create(".wav", directory=root)
+            mgr.remove_delayed(p0, delay=30.0, max_retries=1)
             time.sleep(0.05)
             before_threads = sum(
                 1 for t in threading.enumerate() if t.name == "TempFileDelayedDelete"
             )
             for i in range(5):
-                p = root / f"miku_q_{i}.wav"
-                p.write_text("x", encoding="utf-8")
-                mgr.remove_delayed(str(p), delay=30.0, max_retries=1)
+                p = mgr.create(".wav", directory=root)
+                mgr.remove_delayed(p, delay=30.0, max_retries=1)
             after_threads = sum(
                 1 for t in threading.enumerate() if t.name == "TempFileDelayedDelete"
             )
@@ -290,18 +287,18 @@ class TempFileManagerBoundsTests(unittest.TestCase):
 
     def test_tts_shutdown_reclaims_owned_temp_manager(self) -> None:
         with patch("src.voice.tts.engine.AudioPlayer"), patch(
-            "src.voice.rvc.infer.stop_rvc_worker"
+            "src.voice.rvc.infer.stop_rvc_worker", return_value=True
         ):
             engine = TTSEngine(
                 engine="pyttsx3",
                 fallback_enabled=False,
                 pipeline_enabled=False,
                 rvc_config={},
+                warm_rvc_on_init=False,
             )
-            # 强制启动 delayed worker
-            engine._temp_files.remove_delayed(
-                str(Path("nonexistent_for_queue.wav")), delay=30.0
-            )
+            # 强制启动 delayed worker：创建并登记后延迟删除
+            owned = engine._temp_files.create(".wav")
+            engine._temp_files.remove_delayed(owned, delay=30.0)
             time.sleep(0.05)
             engine.shutdown()
             engine.shutdown()
@@ -666,7 +663,7 @@ class HistoryConfigWiringTests(unittest.TestCase):
         cfg = _Cfg(
             {
                 "ollama": {
-                    "base_url": "http://x",
+                    "base_url": "http://127.0.0.1:9",
                     "model": "m",
                     "timeout": 1,
                     "keep_alive": "1m",
@@ -722,7 +719,7 @@ class HistoryConfigWiringTests(unittest.TestCase):
     def test_injected_history_not_overwritten(self) -> None:
         hist = ConversationHistory(max_stored_turns=3)
         client = OllamaClient(
-            base_url="http://fake",
+            base_url="http://127.0.0.1:9",
             model="t",
             history=hist,
             max_stored_turns=99,
@@ -740,7 +737,7 @@ class ExtractorFirstPersonGuardTests(unittest.TestCase):
 
     def test_parse_skips_first_person_keeps_third(self) -> None:
         extractor = OllamaMemoryExtractor(
-            base_url="http://fake",
+            base_url="http://127.0.0.1:9",
             model="m",
             timeout=1.0,
             keep_alive="1m",

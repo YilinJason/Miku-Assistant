@@ -14,9 +14,10 @@ import threading
 import time
 from typing import Callable, Iterable, Literal, Optional
 
-from src.cli.voice_preflight import ensure_voice_ready
+from src.cli.voice_preflight import check_voice_preflight
 from src.core.assistant import MikuAssistant
 from src.core.dispatch_outcome import DispatchOutcome, ReplyStage
+from src.core.log_privacy import exception_log_label
 from src.core.speech_queue import PlaybackStatus
 from src.voice.input_gate import VoiceInputGate
 from src.voice.recognition import RecognitionResult, RecognitionStatus
@@ -25,6 +26,58 @@ SessionExit = Literal["exit", "switch_text", "unsafe_pause", "stt_error"]
 
 DEFAULT_STOP_KEYWORDS = ("退出语音", "退出", "返回", "quit voice", "exit voice")
 VOICE_MODE_STOP_KEYWORDS = ("退出", "结束", "停止", "quit", "exit", "stop", "bye", "再见")
+
+
+def _reply_activity_window(
+    task: "_ReplyTask",
+    *,
+    now: float,
+    grace: float,
+) -> tuple[float, float]:
+    """保守估计的回复活动窗口（生成+播报），非实际已播放 PCM。"""
+    start = task.started_at if task.started_at > 0.0 else now
+    if not task.done.is_set():
+        return start, now
+    finish = task.finished_at if task.finished_at > 0.0 else now
+    return start, finish + grace
+
+
+def _intervals_overlap(
+    start_a: float,
+    end_a: float,
+    start_b: float,
+    end_b: float,
+) -> bool:
+    return start_a < end_b and start_b < end_a
+
+
+def duplex_output_active_during_capture(
+    recognition: RecognitionResult,
+    task: Optional["_ReplyTask"],
+    *,
+    now: float,
+    grace: float,
+) -> bool:
+    """识别片段是否与回复活动窗口重叠（用于门控）；无采集时间戳时退回旧墙钟逻辑。"""
+    if task is None:
+        return False
+    cap_start = recognition.capture_start_mono
+    cap_end = recognition.capture_end_mono
+    if cap_start is not None and cap_end is not None:
+        window_start, window_end = _reply_activity_window(
+            task, now=now, grace=grace
+        )
+        return _intervals_overlap(
+            float(cap_start),
+            float(cap_end),
+            window_start,
+            window_end,
+        )
+    if not task.done.is_set():
+        return True
+    if task.finished_at > 0.0 and now - task.finished_at <= grace:
+        return True
+    return False
 
 
 class _ReplyTask:
@@ -36,6 +89,7 @@ class _ReplyTask:
         self.thread: Optional[threading.Thread] = None
         self.outcome: Optional[DispatchOutcome] = None
         self.error: Optional[Exception] = None
+        self.started_at = 0.0
         self.finished_at = 0.0
         self._text_parts: list[str] = []
         self._lock = threading.Lock()
@@ -102,13 +156,13 @@ class VoiceSession:
             assistant.config.get("assistant.duplex_listen_timeout", 0.8)
         )
         self._duplex_phrase_time_limit = float(
-            assistant.config.get("assistant.duplex_phrase_time_limit", 6.0)
+            assistant.config.get("assistant.duplex_phrase_time_limit", 16.0)
         )
         self._duplex_echo_grace = float(
             assistant.config.get("assistant.duplex_echo_grace_seconds", 1.0)
         )
         self._duplex_interrupt_wait = float(
-            assistant.config.get("assistant.duplex_interrupt_wait_timeout", 5.0)
+            assistant.config.get("assistant.duplex_interrupt_wait_timeout", 20.0)
         )
         self._input_gate = VoiceInputGate(
             min_interrupt_chars=int(
@@ -209,89 +263,134 @@ class VoiceSession:
                 print("继续监听中...\n")
 
     def _run_duplex(self) -> SessionExit:
-        """回复在受控后台任务中运行；当前线程始终独占麦克风并连续识别。"""
-        active: Optional[_ReplyTask] = None
-        listen_count = 0
-        last_hint_count = 0
+        """回复在受控后台任务中运行；主线程消费连续采集片段并驱动识别。"""
+        capture_attempted = False
+        outcome: SessionExit = "exit"
+        active_holder: list[Optional[_ReplyTask]] = [None]
         try:
-            while True:
-                if (
-                    self.show_periodic_hint
-                    and listen_count > 0
-                    and listen_count % 5 == 0
-                    and listen_count != last_hint_count
-                ):
-                    print("实时监听中...（可直接插话）\n")
-                    last_hint_count = listen_count
-
-                self._report_reply_failure(active)
-                recognition = self._recognize_once(
-                    timeout=self._duplex_listen_timeout,
-                    phrase_time_limit=self._duplex_phrase_time_limit,
-                )
-                now = time.monotonic()
-                output_active = bool(active is not None and not active.done.is_set())
-                echo_tail = bool(
-                    active is not None
-                    and active.done.is_set()
-                    and active.finished_at > 0
-                    and now - active.finished_at <= self._duplex_echo_grace
-                )
-
-                if recognition.status is RecognitionStatus.SILENCE_TIMEOUT:
-                    continue
-                if recognition.status is RecognitionStatus.UNRECOGNIZED:
-                    if not output_active:
-                        self._notify_unrecognized()
-                    continue
-                if recognition.status is RecognitionStatus.CANCELLED:
-                    print("\n语音识别已取消，退出语音模式...\n")
-                    return "exit"
-                if recognition.status is not RecognitionStatus.SUCCESS:
-                    self._print_recognition_error(recognition)
-                    self._interrupt_reply(active)
-                    return "stt_error"
-
-                if active is not None and (output_active or echo_tail):
-                    gate = self._input_gate.evaluate(
-                        recognition.text,
-                        assistant_text=active.text_snapshot(),
-                        output_active=True,
-                    )
-                    if not gate.accepted:
-                        self._logger.info(
-                            "[语音门控] 忽略回复期间输入 reason=%s chars=%d",
-                            gate.decision.value,
-                            len(gate.normalized_text),
+            begin = getattr(self.assistant, "begin_voice_input_session", None)
+            if callable(begin):
+                capture_attempted = True
+                print("正在启动连续采集…", flush=True)
+                started, hint = begin()
+                if not started:
+                    if hint:
+                        print(
+                            f"\n[语音模式] 连续采集不可用：{hint}\n",
+                            flush=True,
                         )
-                        continue
-
-                text = recognition.text
-                listen_count += 1
-                print(f"\n您说: {text}")
-
-                # 有效插话先取消旧生成/播报；回声和低信息内容不会到达这里。
-                if output_active and not self._interrupt_reply(active):
-                    print("\n当前回复未能及时停止，已暂停语音会话以避免任务重叠。\n")
-                    return "unsafe_pause"
-
-                if self.assistant.check_mode_switch(text) == "switch_to_text":
-                    print("\n切换到文本模式...\n")
-                    return "switch_text"
-
-                text_lower = text.lower().strip()
-                if any(keyword in text_lower for keyword in self.stop_keywords):
-                    print("\n退出语音模式...\n")
-                    return "exit"
-
-                active = self._start_reply_task(text)
-                print("\n实时监听中...（可直接插话）\n")
+                    outcome = "stt_error"
+                else:
+                    print("连续采集已就绪，请说话…", flush=True)
+                    outcome = self._run_duplex_loop(active_holder)
+            else:
+                outcome = self._run_duplex_loop(active_holder)
         except KeyboardInterrupt:
             print("\n退出语音模式...\n")
-            return "exit"
+            outcome = "exit"
+        except Exception:
+            outcome = "stt_error"
         finally:
+            if capture_attempted:
+                end = getattr(self.assistant, "end_voice_input_session", None)
+                if callable(end):
+                    try:
+                        if end() is not True:
+                            outcome = "unsafe_pause"
+                    except Exception:
+                        outcome = "unsafe_pause"
+            active = active_holder[0]
             if active is not None and not active.done.is_set():
                 self._interrupt_reply(active)
+        return outcome
+
+    def _run_duplex_loop(
+        self,
+        active_holder: list[Optional[_ReplyTask]],
+    ) -> SessionExit:
+        """全双工监听主循环；退出码由外层 ``_run_duplex`` 汇总并在 ``finally`` 里做采集收尾。"""
+        active: Optional[_ReplyTask] = None
+        active_holder[0] = None
+        listen_count = 0
+        last_hint_count = 0
+        while True:
+            if (
+                self.show_periodic_hint
+                and listen_count > 0
+                and listen_count % 5 == 0
+                and listen_count != last_hint_count
+            ):
+                print("实时监听中...（可直接插话）\n")
+                last_hint_count = listen_count
+
+            self._report_reply_failure(active)
+            recognition = self._recognize_once(
+                timeout=self._duplex_listen_timeout,
+                phrase_time_limit=self._duplex_phrase_time_limit,
+            )
+            now = time.monotonic()
+            reply_still_running = bool(
+                active is not None and not active.done.is_set()
+            )
+            output_active_during_capture = duplex_output_active_during_capture(
+                recognition,
+                active,
+                now=now,
+                grace=self._duplex_echo_grace,
+            )
+
+            if recognition.status is RecognitionStatus.SILENCE_TIMEOUT:
+                continue
+            if recognition.status is RecognitionStatus.UNRECOGNIZED:
+                if not output_active_during_capture:
+                    self._notify_unrecognized()
+                continue
+            if recognition.status is RecognitionStatus.CANCELLED:
+                print("\n语音识别已取消，退出语音模式...\n")
+                return "exit"
+            if recognition.status is not RecognitionStatus.SUCCESS:
+                self._print_recognition_error(recognition)
+                self._interrupt_reply(active)
+                return "stt_error"
+
+            if active is not None and output_active_during_capture:
+                assistant_text = active.text_snapshot()
+            else:
+                assistant_text = ""
+            gate = self._input_gate.evaluate(
+                recognition.text,
+                assistant_text=assistant_text,
+                output_active=output_active_during_capture,
+            )
+            if not gate.accepted:
+                self._logger.info(
+                    "[语音门控] 忽略输入 reason=%s chars=%d",
+                    gate.decision.value,
+                    len(gate.normalized_text),
+                )
+                continue
+
+            text = recognition.text
+            listen_count += 1
+            print(f"\n您说: {text}")
+
+            # 有效插话先取消旧生成/播报；回声和低信息内容不会到达这里。
+            if reply_still_running and not self._interrupt_reply(active):
+                print("\n当前回复未能及时停止，已暂停语音会话以避免任务重叠。\n")
+                return "unsafe_pause"
+
+            if self.assistant.check_mode_switch(text) == "switch_to_text":
+                print("\n切换到文本模式...\n")
+                return "switch_text"
+
+            text_lower = text.lower().strip()
+            if any(keyword in text_lower for keyword in self.stop_keywords):
+                print("\n退出语音模式...\n")
+                return "exit"
+
+            active = self._start_reply_task(text)
+            active_holder[0] = active
+            print("\n实时监听中...（可直接插话）\n")
 
     def _start_reply_task(self, text: str) -> _ReplyTask:
         task = _ReplyTask()
@@ -321,6 +420,7 @@ class VoiceSession:
             name="VoiceReplyTask",
             daemon=True,
         )
+        task.started_at = time.monotonic()
         task.thread.start()
         return task
 
@@ -332,8 +432,12 @@ class VoiceSession:
         if callable(interrupt):
             try:
                 interrupt()
-            except Exception:
-                self._logger.error("取消当前回复失败", exc_info=True)
+            except Exception as exc:
+                self._logger.error(
+                    "取消当前回复失败 err=%s",
+                    exception_log_label(exc),
+                    exc_info=True,
+                )
         if task.done.wait(timeout=max(0.0, self._duplex_interrupt_wait)):
             if task.thread is not None:
                 task.thread.join(timeout=0.2)
@@ -349,7 +453,11 @@ class VoiceSession:
             return
         task.reported = True
         if task.error is not None:
-            self._logger.error("后台回复任务失败: %s", task.error)
+            self._logger.error(
+                "后台回复任务失败 err=%s",
+                exception_log_label(task.error),
+            )
+            # 面向当前用户的 CLI 可保留必要正文；日志不得落盘异常原文
             print(f"\n回复失败: {task.error}\n")
 
     def _recognize_once(
@@ -521,7 +629,29 @@ def run_voice_session(
         on_enter_text_mode: 独立模式下切文本时的自定义回调；默认调用 ``run_text_session``。
         stream_reply: 是否增量+等待播报；``None`` 时读配置 ``assistant.stream_reply``。
     """
-    if not ensure_voice_ready(assistant):
+    report = check_voice_preflight(assistant)
+    if getattr(report, "pending", False) is True:
+        print(report.summary())
+        if standalone:
+            print(
+                "\n本地语音仍在准备中，已切换到文本对话。"
+                "准备完成后可输入「开启语音模式」或 voice 命令再试（不会开麦）。"
+            )
+            from src.cli.text_session import run_text_session
+
+            run_text_session(
+                assistant,
+                allow_voice_switch=True,
+                stream_reply=stream_reply
+                if stream_reply is not None
+                else bool(assistant.config.get("assistant.stream_reply", True)),
+            )
+            return
+        print("语音模式启动失败，请根据上方提示修复后重试。")
+        return
+
+    if not report.ok:
+        print(report.summary())
         print("语音模式启动失败，请根据上方提示修复后重试。")
         return
 
@@ -544,8 +674,8 @@ def run_voice_session(
             print("  - 已启用实时监听：助手回复时可直接插话，回声/低信息输入会被过滤")
         elif stream_reply:
             print("  - 已启用增量回复：本轮播报确认完成后继续听")
-        print("=" * 50)
-        print("\n正在监听中...（请说话）\n")
+        print("=" * 50, flush=True)
+        print("\n正在监听中...（请说话）\n", flush=True)
 
         while True:
             result = VoiceSession(
@@ -567,20 +697,29 @@ def run_voice_session(
                         allow_voice_switch=False,
                         stream_reply=stream_reply,
                     )
-                print("\n返回语音模式...")
+                print("\n返回语音模式...", flush=True)
                 continue
             break
     else:
-        print("\n" + "=" * 50)
-        print("进入持续语音模式")
-        print("=" * 50)
-        print("提示: 直接说话即可，说'关闭语音模式'或'退出语音'返回文本模式")
+        print("\n" + "=" * 50, flush=True)
+        print("进入持续语音模式", flush=True)
+        print("=" * 50, flush=True)
+        print(
+            "提示: 直接说话即可，说'关闭语音模式'或'退出语音'返回文本模式",
+            flush=True,
+        )
         if duplex_listening:
-            print("提示: 已启用实时监听（回复时可插话；自动过滤回声/低信息输入）")
+            print(
+                "提示: 已启用实时监听（回复时可插话；自动过滤回声/低信息输入）",
+                flush=True,
+            )
         elif stream_reply:
-            print("提示: 已启用增量回复（本轮播报确认完成后继续听）")
-        print("=" * 50)
-        print("\n正在监听中...（请说话）\n")
+            print(
+                "提示: 已启用增量回复（本轮播报确认完成后继续听）",
+                flush=True,
+            )
+        print("=" * 50, flush=True)
+        print("\n正在监听中...（请说话）\n", flush=True)
         VoiceSession(
             assistant,
             use_tts=True,

@@ -1,0 +1,19 @@
+# Cosy retained Root：最终 PASS
+
+2026-11-04 Root最终差异复审通过；独立5/5、相关107/107、最后纯fake模块14/14（与107重叠），WAV826精确集合零差。新测试未在共享目录造文件；所有官方CLI已STOP，无本轮真实模型设备。revision/read-only reconciliation保留失败fence和pending门槛，不自动重启故障worker。下一才放行TFM解pin等待窄优化；全量deadline调度/LLM冷载保护仍未完成。
+
+## Root最后fixture复核
+
+纯fake重写后相关107/107已由Root通过（cosy_retained_root_repo_20261104b），WAV826零差。生产仍冻结。唯一剩余新test_concurrent_mark_failed_in_hook_with_join使用lambda线程、未捕获BaseException且线程reference仅hook局部，外层finally不能实际join；done事件不等同线程退出。删除这项重复测试即可：同文件已有真实mutator revision hook+samepath覆盖，Root5另有actual双线程/finally join并发证明，保留这些证明不减关键覆盖。不再为这份测试扩线程框架。只删该方法及其确已无用threading依赖（minimalengine还用threading不能误删）。局部compile/diffcheck后STOP，Root仅复验新模块，不重复无变化相关107。
+
+源码与Root独立`cosy_retained_root5_20261104a`5/5通过，WAV826零差。包含无需分配的admission恢复、仍owned/pending拒绝、retire/stop_failed保留、三类异常原对象以及并发新retained不误清。两个生产文件冻结；旧_release_retained_outputs仍是旧主动责任，revision添加仅供被动快照失效，不扩大本轮职责。
+
+## 新tests文件必须改，尚未运行以避免残留
+
+tests/test_cosyvoice_retained_passive_reconcile.py用真实TFM在共享TMP_DIR造文件，然后_revoke_locked直接丢所有权而没有真实删文件，会造成永不可自动清理的WAV泄漏。addCleanup(tfm.shutdown)返回未断言且发生在TemporaryDirectory退出后；gate.wait不检查，假engine backend无shutdown方法也会导致cleanup出错。这组tests不能执行。
+
+**将这份新测试文件改成纯fake ownership manager/client，不使用TFM.create、真实文件、TMP_DIR、TemporaryDirectory、私有_revoke。** fake manager只维护有限owned/pending状态，is_owned可注入异常；remove/create/retire/prepare如果passive调用就直接fail。真实CosyBackend注入fakemanager/client；admission可用TTSEngine.__new__仅注入_temp_files/_cosy_backend/_player调用真实_assert_turn_stream_admission_resources，不必完整引擎构造或shutdown无资源的shell。
+
+保持已有有效断言：released恢复、owned保留、pending先拒、retireflag/stop_failed不清、异常同对象保留集合、旧fake无reconcile兼容。revision并发可在fake is_owned hook中真实调用backend._mark_failed_output(new)（fakeowned新增），不能直接修改revision凑绿；如启线程必须所有wait检查、finally release/actualjoin/主捕获BaseException。samepath重加亦应让revision快照作废。
+
+本轮仍只tests/docs+局部compile/diffcheck，不运行tests/gate。Root下一独立跑新增模块与相关已隔离fixtures；禁碰Rootprobe/监督器、生产、共享音频和后续TFM/LLM。ADR保持Proposed，handoff如实STOP待验收。

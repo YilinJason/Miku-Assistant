@@ -222,7 +222,7 @@ def _run_grounding_session_check(
     try:
         store.add(
             NewMemory(
-                text='我的测试代号是“银杏4729”，',
+                text='用户的测试代号是“银杏4729”',
                 category=MemoryCategory.USER_PROFILE,
                 source=MemorySource.MODEL_INFERRED,
                 importance=0.9,
@@ -231,7 +231,7 @@ def _run_grounding_session_check(
         )
         store.add(
             NewMemory(
-                text="我最喜欢喝桂花乌龙。",
+                text="用户最喜欢的饮品是桂花乌龙",
                 category=MemoryCategory.PREFERENCE,
                 source=MemorySource.MODEL_INFERRED,
                 importance=0.9,
@@ -394,40 +394,25 @@ def _require_finite_positive(name: str, value: Any) -> float:
 
 def normalize_diagnostic_base_url(raw: str) -> tuple[str, str, Optional[int]]:
     """
-    规范化并校验诊断用 base_url。
+    规范化并校验诊断用 base_url（与主聊天/memory 共用分类规则）。
 
-    规则：
-    - 缺少 scheme 时统一补 ``http://``，并把规范化结果写回调用方使用的 URL；
-    - 仅允许 ``http`` / ``https``；
-    - 拒绝 query / fragment（避免 ``base_url + /api/chat`` 拼接畸形）；
-    - 允许空路径或简单路径前缀；
-    - 非法端口等解析错误转为 ``MemoryValidationError``。
+    - 缺少 scheme 时补 ``http://``；
+    - 仅允许 ``http`` / ``https``；拒绝 userinfo/query/fragment/非根 path；
+    - 不做 DNS。
     """
     if not isinstance(raw, str) or not raw.strip():
         raise MemoryValidationError("base_url must be non-empty str")
     text = raw.strip()
     if "://" not in text:
         text = f"http://{text}"
+    from src.core.network_endpoint import classify_and_normalize_model_url
+
     try:
-        parsed = urlparse(text)
-        # 触发非法端口等解析错误
-        port = parsed.port
+        normalized, _kind = classify_and_normalize_model_url(text)
     except ValueError as exc:
-        raise MemoryValidationError(f"base_url invalid: {exc}") from exc
-
-    scheme = (parsed.scheme or "").lower()
-    if scheme not in ("http", "https"):
-        raise MemoryValidationError("base_url scheme must be http or https")
-    host = parsed.hostname
-    if not host:
-        raise MemoryValidationError("base_url host missing")
-    if parsed.query or parsed.fragment:
-        raise MemoryValidationError("base_url must not contain query or fragment")
-
-    netloc = parsed.netloc
-    path = (parsed.path or "").rstrip("/")
-    normalized = f"{scheme}://{netloc}{path}"
-    return normalized, host, port
+        raise MemoryValidationError(str(exc)) from exc
+    parsed = urlparse(normalized + "/")
+    return normalized, parsed.hostname or "", parsed.port
 
 
 def resolve_diagnostic_endpoint(
@@ -439,12 +424,14 @@ def resolve_diagnostic_endpoint(
     keep_alive: Any = None,
     num_ctx: Any = None,
     num_predict: Any = None,
+    safety_policy: Optional[Any] = None,
 ) -> DiagnosticEndpoint:
     """
     读取 extractor 显式配置并回退 ollama.*（模型/URL/timeout）；
     不要求 memory.enabled。
 
     keep_alive：诊断默认 ``1m``，可由 CLI 覆盖；不继承主聊天 ``ollama.keep_alive=30m``。
+    远端 URL 须经 ``safety_policy`` 放行；省略时仅 loopback。
     """
     raw_url = base_url
     if raw_url is None or raw_url == "":
@@ -454,7 +441,21 @@ def resolve_diagnostic_endpoint(
     if not isinstance(raw_url, str) or not raw_url.strip():
         raise MemoryValidationError("base_url must be non-empty str")
 
-    url, host, port = normalize_diagnostic_base_url(raw_url)
+    text = raw_url.strip()
+    if "://" not in text:
+        text = f"http://{text}"
+    from src.core.network_endpoint import authorize_model_endpoint
+
+    try:
+        sealed = authorize_model_endpoint(
+            safety_policy, text, context="memory_diagnostic"
+        )
+    except (ValueError, PermissionError) as exc:
+        raise MemoryValidationError(str(exc)) from exc
+    url = sealed.base_url
+    parsed = urlparse(url + "/")
+    host = parsed.hostname or ""
+    port = parsed.port
 
     raw_model = model
     if raw_model is None or raw_model == "":
@@ -599,6 +600,7 @@ def run_dry_run(
     http_calls: Optional[list] = None,
     store_calls: Optional[list] = None,
     ingestion_calls: Optional[list] = None,
+    safety_policy: Optional[Any] = None,
 ) -> DiagnosticReport:
     """仅校验参数并描述计划；不得发 HTTP、建库或启动 ingestion。"""
     if http_calls is not None:
@@ -608,6 +610,12 @@ def run_dry_run(
     if ingestion_calls is not None:
         ingestion_calls.clear()
 
+    policy = safety_policy
+    if policy is None:
+        from src.core.safety import SafetyPolicy
+
+        policy = SafetyPolicy.from_app_config(config)
+
     endpoint = resolve_diagnostic_endpoint(
         config,
         base_url=base_url,
@@ -616,6 +624,7 @@ def run_dry_run(
         keep_alive=keep_alive,
         num_ctx=num_ctx,
         num_predict=num_predict,
+        safety_policy=policy,
     )
     report = DiagnosticReport(
         mode="dry-run",
@@ -861,7 +870,11 @@ class FakeDiagnosticLLM:
         return self.generate_result(prompt, stream=stream, system=system).to_legacy_string()
 
 
-def _default_llm_factory(endpoint: DiagnosticEndpoint) -> Any:
+def _default_llm_factory(
+    endpoint: DiagnosticEndpoint,
+    *,
+    safety_policy: Optional[Any] = None,
+) -> Any:
     from src.llm.ollama_client import OllamaClient
 
     return OllamaClient(
@@ -869,6 +882,7 @@ def _default_llm_factory(endpoint: DiagnosticEndpoint) -> Any:
         model=endpoint.model,
         timeout=endpoint.timeout,
         keep_alive=endpoint.keep_alive,
+        safety_policy=safety_policy,
     )
 
 
@@ -1087,9 +1101,15 @@ def run_execute(
     extractor_factory: Optional[Callable[..., OllamaMemoryExtractor]] = None,
     llm_factory: Optional[Callable[[], Any]] = None,
     logger: Optional[logging.Logger] = None,
+    safety_policy: Optional[Any] = None,
 ) -> DiagnosticReport:
     """真实或注入执行：始终使用临时目录下的 SQLite，不触碰正式 db_path。"""
     log = logger or logging.getLogger(__name__)
+    policy = safety_policy
+    if policy is None:
+        from src.core.safety import SafetyPolicy
+
+        policy = SafetyPolicy.from_app_config(config)
     endpoint = resolve_diagnostic_endpoint(
         config,
         base_url=base_url,
@@ -1098,6 +1118,7 @@ def run_execute(
         keep_alive=keep_alive,
         num_ctx=num_ctx,
         num_predict=num_predict,
+        safety_policy=policy,
     )
     prod_path = production_db_path_from_config(config)
     report = DiagnosticReport(
@@ -1129,7 +1150,10 @@ def run_execute(
         store = SqliteMemoryStore(db_path, logger=log)
         make_transport = transport_factory or (
             lambda: RequestsOllamaChatTransport(
-                endpoint.base_url, timeout=endpoint.timeout, logger=log
+                endpoint.base_url,
+                timeout=endpoint.timeout,
+                logger=log,
+                safety_policy=policy,
             )
         )
         transport = make_transport()
@@ -1145,6 +1169,7 @@ def run_execute(
             num_predict=endpoint.num_predict,
             transport=transport,
             logger=log,
+            safety_policy=policy,
         )
         recaller = LexicalMemoryRecall(store, logger=log)
         query = MemoryQueryService(store, recaller=recaller, logger=log)
@@ -1189,7 +1214,9 @@ def run_execute(
             logger=log,
         )
         runtime.start()
-        make_llm = llm_factory or (lambda: _default_llm_factory(endpoint))
+        make_llm = llm_factory or (
+            lambda: _default_llm_factory(endpoint, safety_policy=policy)
+        )
         llm = make_llm()
         wrapper = _run_wrapper_roundtrip(
             runtime=runtime,
@@ -1335,7 +1362,13 @@ def run_diagnostic(
     extractor_factory: Optional[Callable[..., OllamaMemoryExtractor]] = None,
     llm_factory: Optional[Callable[[], Any]] = None,
     logger: Optional[logging.Logger] = None,
+    safety_policy: Optional[Any] = None,
 ) -> DiagnosticReport:
+    policy = safety_policy
+    if policy is None:
+        from src.core.safety import SafetyPolicy
+
+        policy = SafetyPolicy.from_app_config(config)
     if execute:
         report = run_execute(
             config,
@@ -1353,6 +1386,7 @@ def run_diagnostic(
             extractor_factory=extractor_factory,
             llm_factory=llm_factory,
             logger=logger,
+            safety_policy=policy,
         )
     else:
         report = run_dry_run(
@@ -1363,6 +1397,7 @@ def run_diagnostic(
             keep_alive=keep_alive,
             num_ctx=num_ctx,
             num_predict=num_predict,
+            safety_policy=policy,
         )
     if report_path is not None:
         write_report_json(report, Path(report_path))

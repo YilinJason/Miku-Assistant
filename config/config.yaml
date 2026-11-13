@@ -50,9 +50,15 @@ voice:
   # ---------------------------------------------------------------------------
   tts:
     # TTS 引擎标识
-    # 有效值：edge-tts（默认，需网络）| pyttsx3（纯离线应急）
-    # 默认：edge-tts
+    # 有效值：edge-tts（默认，需网络）| pyttsx3（纯离线应急）| cosyvoice（可选本地，须 security.permissions.local_tts_worker: true）
+    # 默认：edge-tts（未预热 CosyVoice；冷首句约 19s、热句含 RVC 约 5.8–8.3s 为实测参考，非 SLA）
     engine: "edge-tts"
+
+    # 可选 CosyVoice 内层参数（仅 engine=cosyvoice；固定 warm_companion，无自由模型/路径/instruct）
+    # 默认整块省略；装配前严格校验，模型仍在首次语音时懒加载，不声称已预热
+    # cosyvoice:
+    #   max_text_chars: 120
+    #   startup_timeout_sec: 30
 
     # edge-tts 的 voice 名称（仅 engine=edge-tts 时生效）
     # 有效值：edge-tts 支持的 Neural 语音名，如 zh-CN-XiaoxiaoNeural
@@ -90,6 +96,28 @@ voice:
     pipeline_enabled: true
 
     # -------------------------------------------------------------------------
+    # edge-tts 句级韵律（仅影响 Communicate 的 rate/pitch/volume；不改正文、不写 SSML）
+    # 非法格式在构造 TTS 前失败；enabled=false 时始终 +0% / +0Hz / +0%
+    # -------------------------------------------------------------------------
+    edge_prosody:
+      # 是否启用句级基值与问句/感叹/省略 delta
+      # 有效值：true | false
+      enabled: true
+      # 基值（严格带符号）：rate/volume 为 +N%/-N%；pitch 为 +NHz/-NHz
+      rate: "-4%"
+      pitch: "+0Hz"
+      volume: "+0%"
+      # 问句相对基值的整数 delta（最终 clamp：rate±30%、pitch±50Hz）
+      question_rate_delta_pct: 2
+      question_pitch_delta_hz: 4
+      # 感叹句
+      exclamation_rate_delta_pct: 2
+      exclamation_pitch_delta_hz: 3
+      # 省略/舒缓（… 或 ...）
+      ellipsis_rate_delta_pct: -3
+      ellipsis_pitch_delta_hz: -2
+
+    # -------------------------------------------------------------------------
     # RVC（Retrieval-based Voice Conversion）音色转换
     # edge-tts 生成 WAV 后，可选经 RVC 转为 Nahida 等自定义音色
     # 首次使用请运行: powershell -ExecutionPolicy Bypass -File scripts/setup_voice_env.ps1
@@ -124,7 +152,7 @@ voice:
       # 默认：true（增加一次启动计算，降低第一句 RVC 等待）
       worker_warmup_inference: true
 
-      # 首次推理预热最长等待秒数；失败只记录警告，真实请求仍可继续
+      # 首次推理预热最长等待秒数；失败则 warm_rvc_worker / prepare_rvc 视为未就绪
       # 默认：45
       worker_warmup_timeout: 45
 
@@ -156,20 +184,22 @@ voice:
       # 默认：40000
       input_sample_rate: 40000
 
-      # vc_single：保护清辅音/气声，减轻电音伪影（越高越保守）
-      # 有效值：0.0 ~ 0.5，推荐 0.45~0.55
+      # vc_single：保护清辅音/气声，减轻电音伪影；0.5 为关闭保护，更小（如 0.33）更保护
+      # 有效值：0.0 ~ 0.5
       # 默认：0.5
       protect: 0.5
 
       # vc_single：源音量包络混合比（1.0 完全用转换后包络；略低更自然）
       # 有效值：0.0 ~ 1.0
-      # 默认：0.75
-      rms_mix_rate: 0.75
+      # 仓库调优：0.68 更多保留源响度包络；听感需人工 A/B，离线测试不证明提升
+      # 代码兼容默认仍为 0.75（无 YAML 调用方不静默改变）
+      rms_mix_rate: 0.68
 
-      # vc_single：f0 中值滤波半径
+      # vc_single：f0 中值滤波半径（仅 f0_method=harvest 时生效；rmvpe 不使用）
       # 有效值：非负整数，0 表示关闭
-      # 默认：3
-      filter_radius: 3
+      # 仓库调优：1；使用 harvest 时可回退 2/3 加强平滑
+      # 代码兼容默认仍为 3（无 YAML 调用方不静默改变）
+      filter_radius: 1
 
       # vc_single：基频提取方法
       # 有效值：rmvpe | harvest | crepe 等（取决于 rvc-python 支持）
@@ -201,20 +231,49 @@ voice:
   stt:
     # STT 引擎标识
     # 有效值：
-    #   speech_recognition — Google 在线识别（默认，需外网；中文准确率一般）
-    #   whisper — 本地 OpenAI Whisper（需 pip install openai-whisper，首次会下载模型）
-    # 默认：speech_recognition
-    engine: "speech_recognition"
+    #   paraformer — 本地 CPU Paraformer-zh + FunASR worker（默认；需 .venv-asr 与 security.permissions.local_asr_worker）
+    #   speech_recognition — Google 在线识别（须 cloud_stt: true；会上传麦克风音频）
+    #   whisper — 本地 OpenAI Whisper（需 pip install openai-whisper，首次可能下载模型）
+    # 默认：paraformer
+    engine: "paraformer"
 
     # 识别语言
     # 有效值：BCP-47 语言标签，如 zh-CN（Whisper 会取主语言 zh）
     # 默认：zh-CN
     language: "zh-CN"
 
-    # 麦克风能量阈值（speech_recognition 用于判断是否有语音；校准后可能被覆盖）
+    # 麦克风能量阈值（speech_recognition / paraformer 录音路径；校准后可能被覆盖）
     # 有效值：正整数；环境嘈杂可调高，说话偏轻可调低（如 300–1500）
     # 默认：4000
     energy_threshold: 4000
+
+    # Paraformer 本地 worker 有界参数（固定资产路径见 src/voice/paraformer/assets.py）
+    paraformer:
+      # CPU 推理线程（有效 1–4）
+      cpu_threads: 2
+      # worker 冷启动上限（秒）
+      startup_deadline_sec: 45
+      # 单次 utterance 推理上限（秒）
+      inference_deadline_sec: 15
+      # shutdown 预算（秒）
+      close_budget_sec: 2
+
+    # 可选：显式麦克风 device_index（null=系统默认）；无效索引报错，不悄悄换设备
+    microphone_device_index:
+
+    # 默认 Paraformer 麦克风路径声学准入（enabled:false 为显式兼容关闭，非自动回退）
+    input_audio:
+      enabled: true
+      capture_mode: continuous
+      backend: silero_onnx
+      speech_probability_threshold: 0.6
+      noise_suppression: webrtc
+      energy_floor: 300
+      energy_ceiling: 12000
+      vad_mode: 2
+      min_voiced_ms: 180
+      min_consecutive_ms: 90
+      min_voiced_ratio: 0.12
 
 # -----------------------------------------------------------------------------
 # 系统功能配置
@@ -253,10 +312,55 @@ security:
     # 默认：false
     system_power: false
 
-    # 启动子进程（浏览器、RVC CLI、外部程序等）
+    # 启动子进程（通用兼容入口；RVC 使用下方专用能力，不依赖本项）
+    # 有效值：true | false
+    # 默认：false
+    subprocess: false
+
+    # RVC 常驻 Worker 子进程（固定解释器 + scripts/rvc_worker.py）
     # 有效值：true | false
     # 默认：true
-    subprocess: true
+    rvc_worker: true
+
+    # RVC 一次性推理子进程（固定解释器 + scripts/rvc_infer.py）
+    # 有效值：true | false
+    # 默认：true
+    rvc_infer: true
+
+    # RVC 环境/设备探测（固定 -c 片段）
+    # 有效值：true | false
+    # 默认：true
+    rvc_probe: true
+
+    # 非 loopback 模型端点（HTTPS 或需 insecure_* 的明文 HTTP）
+    # 有效值：true | false
+    # 默认：false；开启后 system/历史/用户正文可发往该主机
+    remote_model_endpoint: false
+
+    # 非 loopback 明文 HTTP 模型端点（须同时开启 remote_model_endpoint）
+    # 有效值：true | false
+    # 默认：false；流量无 TLS
+    insecure_remote_model_http: false
+
+    # 云端 STT（Google recognize_google）：会上传麦克风音频
+    # 有效值：true | false
+    # 默认：false（默认本地 Paraformer）；回退 Google 须 engine: speech_recognition 且 cloud_stt: true
+    cloud_stt: false
+
+    # 云端 TTS（edge-tts）：会发送待朗读回复文本
+    # 有效值：true | false
+    # 默认：true（保持现有 edge-tts）；裸 SafetyPolicy() 仍拒绝
+    cloud_tts: true
+
+    # 可选 CosyVoice 本地 runtime worker（固定 PROJECT_ROOT 资产；与 engine=cosyvoice 联用）
+    # 有效值：true | false
+    # 默认：false（保持 edge-tts 默认路径）
+    local_tts_worker: false
+
+    # 本地 Paraformer ASR worker（固定 PROJECT_ROOT 资产；与 engine=paraformer 联用）
+    # 有效值：true | false
+    # 默认：true；裸 SafetyPolicy() 仍拒绝
+    local_asr_worker: true
 
     # os.system 类 Shell 调用（高风险，默认关闭）
     # 有效值：true | false
@@ -268,7 +372,7 @@ security:
     # 默认：false；搜索结果仍可打印 URL
     browser_launch: false
 
-    # 删除文件（仅限白名单目录：logs、data/tmp、data/test）
+    # 删除文件（仅限白名单目录：logs、data/tmp、data/test；临时音频另需 TempFileManager 所有权）
     # 有效值：true | false
     # 默认：true
     file_delete: true
@@ -334,6 +438,13 @@ assistant:
   # 默认：true（缩短首段等待）
   stream_reply: true
 
+  # 本地陪伴人格（固定模板；零额外模型调用）
+  # enabled 必须为严格 bool；false 时完全不注入基础人格
+  # profile 仅接受仓库审查值 warm_balanced；未知值 fail closed
+  companion:
+    enabled: true
+    profile: warm_balanced
+
   # 语音回复期间是否继续监听；有效用户插话会取消当前生成/播报
   # 当前为转写级回声过滤，不等同于声学 AEC；建议使用耳机获得最佳效果
   duplex_listening: true
@@ -341,14 +452,15 @@ assistant:
   # 全双工监听每次等待语音开始的超时（秒）；较短值便于会话及时退出
   duplex_listen_timeout: 0.8
 
-  # 一次插话最长录音秒数
-  duplex_phrase_time_limit: 6.0
+  # 一次录音最长秒数。过短会把没说完的话截断后送去识别。
+  duplex_phrase_time_limit: 16.0
 
   # 播放结束后继续把相似转写视作回声的宽限时间（秒）
   duplex_echo_grace_seconds: 1.0
 
-  # 有效插话后等待旧回复任务停止的上限（秒）；超时则暂停会话避免任务重叠
-  duplex_interrupt_wait_timeout: 5.0
+  # 有效插话后等待旧回复任务停止的上限（秒）；超时则暂停会话避免任务重叠。
+  # 冷启动首段可能超过 5 秒，过短会把正常回复误判成停不下来。
+  duplex_interrupt_wait_timeout: 20.0
 
   # 回复期间普通插话最少规范化字符数；“停/stop”等控制词不受此限制
   duplex_min_interrupt_chars: 2
@@ -381,24 +493,32 @@ assistant:
 
   logging:
     # 是否将日志写入 logs/ 目录（便于崩溃后排查）
-    # 有效值：true | false
+    # 有效值：true | false（必须为真 bool）
     # 默认：true
     file_enabled: true
 
-    # 主日志文件名（位于 logs/ 下）
-    # 有效值：字符串，如 miku.log
+    # 主日志文件名（必须是 logs/ 下的单个安全文件名，禁止路径分量）
+    # 有效值：如 miku.log；拒绝 ../、盘符、CON/NUL 等
     # 默认：miku.log
     file_name: "miku.log"
 
     # 单个日志文件大小上限（MB），超出后自动轮转
-    # 有效值：正整数
+    # 有效值：有限正数，硬上限 50；拒绝 bool/字符串/NaN/Inf
+    # 换算上取整且至少 1 字节（避免极小正数变成 maxBytes=0 禁用轮转）
     # 默认：10
+    # 持久日志磁盘上界约 max_size_mb * (backup_count + 1)；backup_count=0 时为单文件有界截断
     max_size_mb: 10
 
     # 轮转后保留的历史文件数量（miku.log.1 ~ .N）
-    # 有效值：非负整数
+    # 有效值：真 int，范围 0..10；0=仅主文件，超限后同路径截断（不创建 .1）
     # 默认：5
     backup_count: 5
+
+    # 文件日志是否持久化 traceback（含绝对源码路径与异常链）
+    # 有效值：true | false（必须为真 bool）
+    # 默认：false（仅影响文件 handler；控制台不受此开关改变）
+    # 即使为 true，调用点仍禁止记录用户正文/查询/URL/原始 stderr
+    include_tracebacks: false
 
   file_cleanup:
     # 后台清理任务检查间隔（分钟）
@@ -496,5 +616,8 @@ resource:
   warmup:
     serialize_gpu: true
     order: ollama_then_rvc
+    # 资源协调等待 Ollama 预热（串行 GPU）硬上限秒；与前台等待分离；最大 300
     # null/缺省时回退 ollama.warmup_timeout
     timeout: 120
+    # 用户前台正式请求等待后台预热的短上限秒；默认 5，硬上限 10
+    foreground_wait_sec: 5

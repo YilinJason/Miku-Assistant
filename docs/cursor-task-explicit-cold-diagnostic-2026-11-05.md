@@ -1,0 +1,9 @@
+# 明确标注冷启动诊断模式（仅tmp监督器，已放行）
+
+Root真实RVC3×10已PASS（memleak_rvc3_nov5a，80.53秒，回收complete）。Cosy+RVC默认30秒startup测试memleak_voice6_two_nov5b失败在automodel_construct：resource_admission6.0秒、import约17.6秒，未进入合成；所有owned进程和TFM已回收。这是默认冷启动未达标，不得抹掉或称测试成功。
+
+为了单独检查重复生成的资源趋势，显式放行已有child smoke的`--extended-cold`（child已支持固定startup_timeout_sec=60并报告extended_cold_diagnostic=True）。生产config/src/默认30秒不得改，父监督总180秒和全部内存/GPU/commit准入/中止线不得改。不是默认延长以宣称优化，只是有标签的诊断。
+
+本次例外允许修改且仅修改tmp/codex_real_voice_supervision.py：GateFlags新增extended_cold:bool=False，parse_gate_argv解析`--extended-cold`，只在显式True时由child_script_and_args传同flag给smoke；default、rvc_only和torch_only不得偷偷增加flag，extended与rvc_only/torch_only组合validate应拒绝。final summary新增extended_cold_diagnostic字段以说明条件。不得添加任意argv透传/新脚本路径/关闭预检选项，不改主gate、其它harness/采样器或生产。
+
+仅本授权覆盖此前“不能修改Root监督器”这一个文件这一个有界模式，其它限制保持。你不运行任何测试/模型/网络，只有AST/compile/diffcheck后STOP，返回精确diff。Root会独立检查默认不变、flag合法组合和转发，再复验现有24监督器fake，最后按同资源线运行显式extended冷诊断。原默认失败报告、所有已有报告禁止覆盖。

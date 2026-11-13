@@ -50,7 +50,13 @@ def confirm_system_action(command: str) -> bool:
     try:
         return _show_win32_message_box(title, message)
     except Exception as exc:
-        logger.error("确认对话框显示失败: %s", exc)
+        from src.core.log_privacy import exception_log_label
+
+        logger.error(
+            "确认对话框显示失败 action=%s err=%s",
+            command,
+            exception_log_label(exc),
+        )
         return False
 
 

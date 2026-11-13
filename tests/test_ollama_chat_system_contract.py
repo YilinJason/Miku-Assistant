@@ -73,7 +73,7 @@ class _NoopIngestion:
 
 class ChatSystemContractTests(unittest.TestCase):
     def _client(self) -> OllamaClient:
-        return OllamaClient(base_url="http://fake-ollama", model="test-model")
+        return OllamaClient(base_url="http://127.0.0.1:9", model="test-model")
 
     def test_non_stream_system_is_first_message_no_top_level_system(self) -> None:
         client = self._client()
@@ -179,20 +179,20 @@ class ChatSystemContractTests(unittest.TestCase):
             try:
                 store.add(
                     NewMemory(
-                        text='我的测试代号是“银杏4729”。',
+                        text='用户的测试代号是“银杏4729”',
                         category=MemoryCategory.USER_PROFILE,
                         source=MemorySource.MODEL_INFERRED,
                     )
                 )
                 store.add(
                     NewMemory(
-                        text="我最喜欢喝桂花乌龙。",
+                        text="用户最喜欢的饮品是桂花乌龙",
                         category=MemoryCategory.PREFERENCE,
                         source=MemorySource.MODEL_INFERRED,
                     )
                 )
                 query = MemoryQueryService(store)
-                inner = OllamaClient(base_url="http://fake-ollama", model="test-model")
+                inner = OllamaClient(base_url="http://127.0.0.1:9", model="test-model")
                 aware = MemoryAwareLLMClient(
                     inner, query, _NoopIngestion(), max_entries=8, max_chars=2000
                 )
@@ -259,7 +259,7 @@ class ChatSystemFailureNoDoubleCommitTests(unittest.TestCase):
     """既有失败/提前 close 语义：不因 system 契约改动产生双提交。"""
 
     def test_non_stream_failure_does_not_commit(self) -> None:
-        client = OllamaClient(base_url="http://fake-ollama", model="m")
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="m")
         with patch(
             "src.llm.ollama_client.requests.post",
             side_effect=requests.exceptions.ConnectionError("down"),
@@ -269,7 +269,7 @@ class ChatSystemFailureNoDoubleCommitTests(unittest.TestCase):
         self.assertEqual(client.conversation_history, [])
 
     def test_stream_early_close_does_not_commit(self) -> None:
-        client = OllamaClient(base_url="http://fake-ollama", model="m")
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="m")
         resp = _StreamResponse(["半"])
         with patch("src.llm.ollama_client.requests.post", return_value=resp):
             it = client.generate_stream("early", system="SYS")

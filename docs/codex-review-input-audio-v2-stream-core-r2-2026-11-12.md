@@ -1,0 +1,13 @@
+# Streaming core R2 — two independently reproduced continuity defects
+
+Independentgate `input_v2_stream_contract_nov12y` passedinitial4checks. Extendedgate `input_v2_stream_gap_contract_nov12z` ran6fakechecks andfailed2, WAVunchanged. Rootprobe `tmp/codex_stream_contract_2026_11_12.py` is reviewer-owned; do noteditit.
+
+1. Twoordinaryutterances, each6voicedframes+20quietframes: previousend13312samples, nextstart10752;5frames fromprevioussegmenttailarereemitted. Currentprerollstillappendswhileactiveandisnotclearedonclose. Clear/pruneprerollatsegmentclose (includingfinish/maxsplit); do notallowactiveframes tobeusedasnextutterancepreroll. Maintainconsecutiveclockcorrectly. Continuation'sfirstquietframe mustcount toward20frameend, notsilentlyaddanextra32ms. Formaltestexactnonoverlapacrossordinaryutterances+maxboundarysilence.
+
+2. NSstream with20residualsamples -> cancelledbeforecall -> clearcallercancel -> nextchunk succeedswitholdstate/residual. Failed/cancelledcalls mustnotspliceacrosslostframes. Pre-lockcancelandgeometryerrorsneedaninvalidationREQUEST/Event thatcannotfreearrays/processor concurrentlywithnativeop. Activecallchecksrequestandfailsclosed; actualresidual/nativeownership cleanupunderlock. Busyshouldnotmutateanotheractivecall. Addcancelbeforecall, geometryerrorafterresidual andconcurrentcancel/busyschedules. Noautosilentresetoldstream; requirefreshobjectafterinvalid/cancel.
+
+Also completefinalstatechecks: NSprocess/finish recheckcancel/closing aftertail/copy andimmediatelybefore success; finishmustrecheckstateafteracquiringlock (currentlyno-residualbranchcanmarkfinisheddespiteaclose/cancel thatarrivedwhileacquiring). Batchwrapperrecheckscombinedcancelafterfinishbeforefinalsuccess. Sileroreset rejectsownerclosing/closed too. Keeponeoperationlock, noextrahelperframework.
+
+README/VOICE docs have stale wording under duplex claiming noaudioVAD; updateonlythatdescription to distinguishacceptedNS/Silero inputguard fromtext-levelduplexechofilter. PreserveAECnotimplementedcaveat.
+
+Run documentedfakecoremodules withnewlabel `input_v2_stream_core_r2_cursor_nov12aa`, timeout90, no realmodels/devices/pip/app/data/memory. STOPforindependentreplayandnativeequivalence; no captureintegrationyet.

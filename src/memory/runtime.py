@@ -633,6 +633,9 @@ class MemoryRuntime:
         query_factory: Optional[Callable[..., MemoryQueryService]] = None,
         admission_gate: Optional[ExtractionAdmissionGate] = None,
         logger: Optional[logging.Logger] = None,
+        safety_policy: Optional[Any] = None,
+        sealed_endpoint: Optional[Any] = None,
+        model_memory_guard: Optional[Any] = None,
     ) -> "MemoryRuntime":
         from src.memory.admission import ForegroundAwareAdmissionGate
 
@@ -645,16 +648,22 @@ class MemoryRuntime:
         store: Optional[MemoryStore] = None
         try:
             store = make_store(settings.db_path, logger=log)
-            extractor = make_extractor(
-                base_url=settings.extractor_base_url,
-                model=settings.extractor_model,
-                timeout=settings.extractor_timeout,
-                keep_alive=settings.extractor_keep_alive,
-                max_extractions=settings.max_extractions_per_turn,
-                num_ctx=settings.extractor_num_ctx,
-                num_predict=settings.extractor_num_predict,
-                logger=log,
-            )
+            extractor_kwargs: dict[str, Any] = {
+                "base_url": settings.extractor_base_url,
+                "model": settings.extractor_model,
+                "timeout": settings.extractor_timeout,
+                "keep_alive": settings.extractor_keep_alive,
+                "max_extractions": settings.max_extractions_per_turn,
+                "num_ctx": settings.extractor_num_ctx,
+                "num_predict": settings.extractor_num_predict,
+                "logger": log,
+            }
+            # 工厂可忽略未知关键字；默认 OllamaMemoryExtractor 接受策略
+            if extractor_factory is None:
+                extractor_kwargs["safety_policy"] = safety_policy
+                extractor_kwargs["sealed_endpoint"] = sealed_endpoint
+                extractor_kwargs["model_memory_guard"] = model_memory_guard
+            extractor = make_extractor(**extractor_kwargs)
             ingestion = make_ingestion(
                 store,
                 extractor,

@@ -245,7 +245,7 @@ class WindowsControlSafetyTests(unittest.TestCase):
 
         with _CLEAR_MIKU_DRY_RUN:
             with patch.object(wc_mod, "confirm_system_action", confirm):
-                with patch.object(wc_mod, "safe_subprocess_run", subprocess_run):
+                with patch.object(wc_mod, "safe_system_power_run", subprocess_run):
                     policy = SafetyPolicy({"permissions": {"system_power": False}})
                     self.assertFalse(policy.is_allowed(Operation.SYSTEM_POWER))
                     controller = WindowsController(
@@ -268,7 +268,7 @@ class WindowsControlSafetyTests(unittest.TestCase):
 
         with _CLEAR_MIKU_DRY_RUN:
             with patch.object(wc_mod, "confirm_system_action", confirm):
-                with patch.object(wc_mod, "safe_subprocess_run", subprocess_run):
+                with patch.object(wc_mod, "safe_system_power_run", subprocess_run):
                     policy = SafetyPolicy({"permissions": {"system_power": True}})
                     self.assertTrue(
                         policy.is_allowed(Operation.SYSTEM_POWER),

@@ -7,7 +7,7 @@ import logging
 import platform
 from typing import Optional
 
-from src.core.safety import Operation, SafetyPolicy, safe_subprocess_run
+from src.core.safety import Operation, SafetyPolicy, safe_system_power_run
 from src.system.confirm_dialog import confirm_system_action
 
 
@@ -80,7 +80,9 @@ class WindowsController:
 
     def _execute_command(self, command: str) -> str:
         """
-        执行单个系统命令（含 dry_run、确认与 safe_subprocess_run）。
+        执行单个系统命令（含 dry_run、确认与 ``safe_system_power_run``）。
+
+        双门：``system_power`` 权限 + 用户确认；不依赖通用 ``subprocess`` 权限。
 
         Args:
             command: ``shutdown`` / ``restart`` / ``lock`` 之一。
@@ -98,27 +100,20 @@ class WindowsController:
 
         try:
             ctx = f"windows_control:{command}"
-            if command == "shutdown":
-                safe_subprocess_run(
-                    self.safety_policy, ["shutdown", "/s", "/t", "60"],
-                    check=True, context=ctx,
-                )
-            elif command == "restart":
-                safe_subprocess_run(
-                    self.safety_policy, ["shutdown", "/r", "/t", "60"],
-                    check=True, context=ctx,
-                )
-            elif command == "lock":
-                safe_subprocess_run(
-                    self.safety_policy,
-                    ["rundll32.exe", "user32.dll,LockWorkStation"],
-                    check=True, context=ctx,
-                )
-            else:
+            if command not in ("shutdown", "restart", "lock"):
                 return f"未知命令: {command}"
+            safe_system_power_run(
+                self.safety_policy, command, check=True, context=ctx
+            )
             return self._REAL_MESSAGES[command]
         except PermissionError as exc:
             return f"[已拦截] {exc}"
         except Exception as exc:
-            self.logger.error("系统命令错误: %s", exc)
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.error(
+                "系统命令错误 action=%s err=%s",
+                command,
+                exception_log_label(exc),
+            )
             return f"错误: {exc}"

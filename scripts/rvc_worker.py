@@ -30,7 +30,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.voice.rvc.vc_params import build_vc_kwargs
+
+def _early_join_owned_job() -> None:
+    from src.core.owned_worker_job import worker_entry_join_owned_job
+
+    worker_entry_join_owned_job()
 
 
 def _patch_torch_load_for_fairseq() -> None:
@@ -80,9 +84,18 @@ def _load_vc(model_path: str, device: str):
     Returns:
         ``(vc, device)`` 元组：已加载模型的 VC 对象与实际设备字符串。
     """
+    from src.voice.rvc.local_assets import ensure_rvc_python_local_assets
+
+    assets = ensure_rvc_python_local_assets()
+    lib_dir = assets.lib_dir
+
+    from src.voice.rvc.cpu_budget import apply_rvc_torch_thread_budget
+
+    apply_rvc_torch_thread_budget()
+    _patch_torch_load_for_fairseq()
+
     from rvc_python.configs.config import Config
     from rvc_python.modules.vc.modules import VC
-    from rvc_python.download_model import download_rvc_models
 
     if device.startswith("cuda"):
         import torch
@@ -90,8 +103,6 @@ def _load_vc(model_path: str, device: str):
         if not torch.cuda.is_available():
             device = "cpu"
 
-    lib_dir = os.path.dirname(os.path.abspath(__import__("rvc_python").__file__))
-    download_rvc_models(lib_dir)
     config = Config(lib_dir, device)
     vc = VC(lib_dir, config)
     vc.get_vc(model_path, "v2")
@@ -101,6 +112,8 @@ def _load_vc(model_path: str, device: str):
 def _convert(vc, req: dict, worker_cfg: dict) -> tuple[bool, str, float]:
     """根据 JSON 请求执行单次音色转换并写出 WAV。"""
     from scipy.io import wavfile
+
+    from src.voice.rvc.vc_params import build_vc_kwargs
 
     input_path = req["input"]
     output_path = req["output"]
@@ -258,13 +271,13 @@ def main() -> int:
         "--protect",
         type=float,
         default=0.5,
-        help="protect 参数，越高越保护清辅音、减轻伪影",
+        help="protect 参数：0.5 关闭保护，更小更保护清辅音/气声",
     )
     parser.add_argument(
         "--filter-radius",
         type=int,
         default=3,
-        help="中值滤波半径，用于 f0 平滑",
+        help="Harvest f0 中值滤波半径（rmvpe 不使用）",
     )
     parser.add_argument(
         "--rms-mix-rate",
@@ -290,8 +303,6 @@ def main() -> int:
     if not os.path.isfile(args.model):
         _emit_json({"ready": False, "error": f"Model not found: {args.model}"})
         return 1
-
-    _patch_torch_load_for_fairseq()
 
     try:
         t0 = time.perf_counter()
@@ -385,4 +396,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _early_join_owned_job()
     sys.exit(main())

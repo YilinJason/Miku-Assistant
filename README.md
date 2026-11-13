@@ -1,391 +1,396 @@
 # Miku Assistant LLM
 
-Windows 桌面语音助手：本地 **Ollama** 大模型 + **语音对话** + **edge-tts / RVC 音色** + **系统控制** + **浏览器搜索**。
-
-面向中文用户，默认将 edge-tts 合成音经 **RVC** 转为 Nahida 角色音色，支持文本 / 语音 / 交互三种模式。
+Windows 本地桌面助手：**Ollama 对话**、**长期记忆**、**语音双工**、**本地 Paraformer STT（默认）**、**Edge-TTS / 可选 CosyVoice + RVC 音色**、**受策略约束的系统控制与搜索**。面向中文场景；**TTS 默认仍走 edge-tts 云端**，STT 默认在资产就绪后为本地 CPU，并非开箱即全离线产品。
 
 ---
 
-## 功能概览
+## 定位与当前状态
 
-| 功能 | 说明 |
+- **平台**：Windows 10 / 11；主程序 **Python 3.12**，入口 `main.py` → `src/cli/app.py`。
+- **形态**：CLI 三种模式 `text` / `voice` / `interactive`；按启动模式懒加载语音栈。纯 **`text`** 模式固定 `use_tts=False`；**`--auto-tts` 不作用于 `text` 模式**（主要影响 `interactive`）。
+- **交付与验收**：近期语音链路与资源里程碑见 [`docs/codex-review-final-voice-soak-milestone-2026-11-05.md`](docs/codex-review-final-voice-soak-milestone-2026-11-05.md)、[`docs/current-delivery-status-2026-11-04.md`](docs/current-delivery-status-2026-11-04.md)。**具体指标与适用范围见下文「已验证范围（语音长测）」**；此前失败/取消 run 仍有效，不代表所有模式在所有硬件上已通过。
+- **未实现 / 预留**：Quest 3 / Unity / Live2D / 3D 引擎；`src/extensions/character_interface.py` 仅为占位日志；**声学 AEC** 未实现；`wake_word` 仅为配置字符串，**不是**独立唤醒词服务。
+
+---
+
+## 功能与技术栈（已实现）
+
+| 板块 | 能力摘要 | 主要技术 / 入口 |
+|------|----------|-----------------|
+| **CLI 与会话** | `text` / `voice` / `interactive`；interactive 支持 `help` / `voice` / `tts` / `stream` / `quit` | `main.py`，`src/cli/` |
+| **LLM** | HTTP `requests` → Ollama `/api/chat`（JSON / NDJSON 流）；进程内**短历史**（默认最多 **500** 完整轮）与**单次请求窗口**分离；`keep_alive` 默认 **30m** | `src/llm/`，`ollama.history.max_stored_turns` |
+| **长期记忆** | 跨重启：**SQLite** 中有界事实；**进程内**另有对话短历史（见上），**二者不同**。用户原文 → `UserFactUnit` → 模型选 `unit_id` → **异步**后台入库（**不一定立刻写入**）；生成前**词法召回**注入；**不保证**每句聊天都进库、**非**全量对话归档 | **`sqlite3` + 事务 + `threading.RLock`**，`src/memory/`；队列 **32** / 每轮最多提取 **16** |
+| **记忆保留** | 启用保留时，约每 **24h** 在**空闲且无前台请求**时尝试 prune（`batch_limit` **64**）；目标 **2000** 条 / **365** 天 | **维护目标**，非硬上限；热路径不 VACUUM |
+| **意图路由** | 系统控制 → 搜索 → LLM；系统/搜索回复 **`allow_tts=True`**，在 **`use_tts` / `auto_tts` 开启**时可朗读结果（非 LLM 专用） | `src/core/dispatch_outcome.py`，路由 handler |
+| **搜索** | 正则 + `urllib.parse` 构造 Google/Bing/Baidu/B 站 URL；`browser_launch` 默认 **false**（可只打印 URL） | `src/search/`；**非**爬虫/API 全文/RAG |
+| **系统控制** | 关机/重启/锁屏；Win32 + **确认对话框**；`system.windows_control_enabled` 与 `security.permissions.system_power` 默认 **false** | `src/system/`，`src/core/safety.py` |
+| **STT 默认** | **Paraformer-zh + FunASR** 于 **`.venv-asr`**（CPU torch，与主程序/RVC/Cosy **分离**）；**SpeechRecognition + PyAudio** 仍负责麦克风采集；`local_asr_worker: true` + 封存 profile；**无** Paraformer→Google 自动回退 | `src/voice/stt.py`，`scripts/prepare_paraformer.py`，`diagnose_asr.py` |
+| **STT 遗留** | **`speech_recognition` + Google** 仍可用：须 `voice.stt.engine: speech_recognition` **且** `cloud_stt: true`（会上传音频） | 显式配置 |
+| **STT 可选** | **Whisper**（如 `base`，主进程内加载）；**未**在 `requirements.txt` 中；首次可能联网，需额外 **torch/模型内存** | 可选路径 |
+| **TTS 默认** | **edge-tts**（`cloud_tts: true` 发送朗读文本）；句级 rate/pitch/volume；长回复 **分句流水线** | `src/voice/tts/engine.py` |
+| **TTS 应急** | **pyttsx3**（**不经 RVC**） | `requirements-optional.txt` |
+| **TTS 可选 Cosy** | CosyVoice 300M-Instruct 自有 worker（stdin/stdout JSON 行）；固定 **warm_companion**；**需 NVIDIA CUDA**（无 CUDA 拒绝，无 CPU 回退）；CPU 权重 **checkpoint 分阶段加载 + mmap**（worker 内，见 `checkpoint_loading.py`） | [`assets.py`](src/voice/cosyvoice/assets.py) 等 |
+| **RVC** | Nahida；**`.venv-rvc`** worker + 可选单次 infer；**CPU 线程预算**注入子进程/Torch（`cpu_budget.py`） | rvc-python / PyTorch / fairseq / HuBERT / RMVPE / FAISS |
+| **音频 DSP** | librosa / NumPy / SciPy / soundfile；RVC 后处理高通 + 软限幅 | `src/voice/rvc/postprocess.py` 等 |
+| **播放** | **pygame** 优先 | `src/voice/audio/player.py` |
+| **双工语音** | 全双工连续采集（显式 begin，`capture_mode: continuous`）；转写门控用采集区间 vs 回复活动窗（非播放 PCM/AEC）；有效插话取消 | `src/cli/voice_session.py`，`assistant.duplex_*`，[`docs/VOICE.md`](docs/VOICE.md) |
+| **自然陪伴** | **warm_balanced** 人格（`src/core/companion.py`）；朗读前 **SpeechProjector**（`src/voice/speech_projection.py`）净化副本；界面与历史保留原文 | 见 `src/core/companion.py` |
+| **日志** | 文件约 **10 MiB** ×（1+**5** 备份）≈ **60 MiB** 量级；`logging.handlers.RotatingFileHandler` + **`PrivacyRotatingFileHandler` 脱敏** | `src/core/logging_setup.py` |
+| **资源与生命周期** | RAM/commit/VRAM 准入、串行预热、有界 turn 预取、**OwnedThreadTask**、Windows **Job**、TFM **IO lease**；与 Cosy **checkpoint staging/mmap**、RVC **CPU 线程预算** 同为已实现的有界资源策略（**不**承诺 universal 加速或省内存） | `resource.profile`：**balanced** 等 |
+| **清理** | `FileCleaner`：`os.scandir` 游标；**10 min** 周期、不同步启动全扫；每轮扫 **500** / 删 **100** | `src/core/file_cleaner.py` |
+| **安全** | `SafetyPolicy` 具名能力 + 白名单；**`registry_write` 代码层永久禁止**（配置无效） | `config/config.yaml` → `security.permissions` |
+| **Ollama 模板** | `modelfile_manager/Modelfile_v1*` … `v2-1` 为 **Ollama 构建模板**，非训练器 | 见下文 Modelfile |
+| **诊断脚本** | 见「诊断与测试分类」 | 根目录 `diagnose_*.py` 等 |
+
+**主环境默认不需要 torch / fairseq**（RVC、Cosy、可选 Whisper 各自独立或额外安装）。
+
+---
+
+## 架构（数据流概览）
+
+```mermaid
+flowchart TB
+  subgraph in [输入]
+    T[文本 CLI]
+    M[麦克风 STT]
+  end
+  A[MikuAssistant]
+  R[IntentRouter]
+  Sys[系统控制]
+  Srch[搜索 URL]
+  O[Ollama HTTP]
+  DB[(SQLite long_term)]
+  Mem[memory 召回/入库]
+  Disp[显示与对话历史 原文]
+  Proj[SpeechProjector 朗读副本]
+  Edge[edge-tts / CosyVoice]
+  Py[pyttsx3 应急]
+  RVC[RVC 可选]
+  DSP[后处理 DSP]
+  PL[pygame 播放]
+
+  T --> A
+  M --> A
+  A --> R
+  R --> Sys
+  R --> Srch
+  R --> O
+  Mem --> A
+  A --> Mem
+  Mem <--> DB
+  Sys --> A
+  Srch --> A
+  O --> A
+  A --> Disp
+  A --> Proj
+  Proj --> Edge
+  Proj --> Py
+  Py --> PL
+  Edge --> RVC --> DSP --> PL
+```
+
+- **记忆**：生成前从 SQLite **召回**注入上下文；成功轮次后 **有界异步入库**（与 LLM 生成串行协调，**非**任意并行抢 GPU）。
+- **系统 / 搜索**：结果回到助手；在 **`use_tts` / `auto_tts` 允许**时可 TTS（`from_legacy_handler_text` → `allow_tts=True`）。
+- **Edge / Cosy** 可接可选 **RVC + DSP**；**pyttsx3** **不经** RVC。朗读副本与屏幕/进程内短历史分离。
+
+---
+
+## 运行环境与依赖
+
+| 环境 | Python | 用途 | 依赖 |
+|------|--------|------|------|
+| **主程序** | **3.12**（推荐 `.venv-main`） | CLI、Ollama、Edge、记忆、路由、**Paraformer 编排**（worker 在 `.venv-asr`） | [`requirements.txt`](requirements.txt)（版本下界，非 lock） |
+| **ASR** | **3.12** `.venv-asr` | FunASR Paraformer-zh CPU worker | [`requirements-asr.txt`](requirements-asr.txt) + [`scripts/prepare_paraformer.py`](scripts/prepare_paraformer.py) |
+| **RVC** | **3.11** `.venv-rvc` | rvc-python、PyTorch、fairseq、HuBERT、RMVPE、FAISS | [`scripts/setup_voice_env.ps1`](scripts/setup_voice_env.ps1)（联网安装，未锁全版本） |
+| **CosyVoice** | **3.11** `vendor/CosyVoice/.venv` | PyTorch、torchaudio、ModelScope、WeText、Matcha-TTS、ONNX 等 | 与主环境**勿混装**；路径见 `assets.py` |
+
+主环境 `requirements.txt` 摘录：`pyyaml>=6.0.1`，`requests>=2.31.0`，`edge-tts>=6.1.0`，`librosa>=0.10.0`，`soundfile>=0.12.0`，`numpy>=1.24.0`，`scipy>=1.11.0`，`SpeechRecognition>=3.10.0`，`pyaudio>=0.2.14`，`pygame>=2.5.0`。
+
+**外部**：本机 **Ollama**（`http://localhost:11434`）。**TTS 默认**需网络（edge-tts）；**STT 默认**在准备 `.venv-asr` 与 pin 资产后为本地 CPU（运行时不上传识别音频到 Google）。
+
+---
+
+## 本地 Paraformer ASR 准备（默认 STT）
+
+使用 **主程序 Python 3.12**（勿用 `.venv-rvc` / Cosy `.venv` 跑准备脚本）。下文 **`$PY`** 必须是 **带引号的 `python.exe` 路径**（单个可执行文件，不是「启动器 + 参数」）。**禁止** `$PY = py -3.12`：在 PowerShell 里这会**执行**启动器并可能进入交互式 Python，且不能作为 `& $PY script.py` 的解释器路径。若你更习惯 Windows 启动器，请在每条命令上直接写前缀 **`py -3.12 script\...`**，**不要**把 `py -3.12` 赋给 `$PY`。
+
+```powershell
+Set-Location D:\Miku_Assistant_LLM
+$PY = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
+# 若本机已有 .venv-main 且依赖齐全，可改为（路径按你的克隆目录调整）：
+# $PY = "D:\Miku_Assistant_LLM\.venv-main\Scripts\python.exe"
+& $PY scripts\prepare_paraformer.py --check
+& $PY scripts\prepare_paraformer.py --execute
+```
+
+- **`--execute`** 会创建/更新 **`.venv-asr`**、安装 `requirements-asr.txt` 并下载**固定 pin** 的 `vendor/paraformer-zh` 资产（**一次性显式**；运行中无云回退/无隐式下载）。
+- 准备完成后 **重启助手**，以便装配期 `SafetyPolicy` 重新封存 ASR profile。
+- 诊断（固定 WAV，无麦克风）：`& $PY diagnose_asr.py`（dry-run）；真实 CPU 验收 `& $PY diagnose_asr.py --execute`（Codex 监督门禁，非 unittest）。
+
+**准入（冷启动 headroom，非整机总 RAM 保证）**：可用物理内存 **≥ 4 GiB**、可用系统 commit **≥ 6 GiB**（与 RVC/Cosy 阈值独立）。本机 Codex 固定音频里程碑参考：冷首次推理约 **12 s**；热 p50≈**0.34 s**、p95≈**0.67 s**（仅推理，不含录音停顿/LLM/TTS/RVC）。低配与其它硬件不保证相同延迟或准确率。
+
+**CPU 线程**：`voice.stt.paraformer.cpu_threads` 有效 **1–4**，默认 **2**。本阶段无流式/VAD/热词/标点模型/说话人模型。
+
+**声学准入（Phase 2a 默认 Silero）**：`voice.stt.input_audio.backend` 默认 **`silero_onnx`**（概率门限默认 0.6）；`webrtc` 为显式兼容。固定模型 `vendor/silero-vad/silero_vad.onnx`（校验见 `docs/VOICE.md`），**不**运行期下载。主 `requirements.txt` 通过 `-r requirements-input-audio.txt` 引入 CPU onnxruntime/numpy pin。`python main.py` 启动前会设置 BLAS/OMP 四键为 1（`src/core/numeric_bootstrap.py`）。PCM 硬边界 480000 字节不变。WebRTC 路径仍依赖 **`webrtcvad-wheels==2.0.14.post1`**。未声称已完成真实麦克风复测。
+
+**回退 Google STT**：在 `config/config.yaml` 设置 `voice.stt.engine: speech_recognition` 且 `security.permissions.cloud_stt: true`（会上传麦克风音频）。
+
+**麦克风验收（真实 voice 模式，勿在 PowerShell 提示符里当自然语言输入）**：
+
+1. 完成 ASR 准备并重启后：`& $PY main.py --mode voice`（`$PY` 为上一节设置的 `python.exe` 路径）
+2. 对麦克风说 2–3 句代表性中文（含短问句与稍长陈述），确认助手能收到转写并回复。
+3. 退出 voice 再进入一次，确认重启后记忆/会话行为仍符合预期（**不**声称已通过 30 min 全栈 soak 或声卡 A/B 门禁）。
+
+纯 **`text`** 模式仍 **不** 构造 STT，无 ASR 资产也可启动。
+
+---
+
+## 本地快速启动
+
+在 **PowerShell** 中进入你的克隆目录（**示例**，请改成实际路径）：
+
+```powershell
+Set-Location D:\Miku_Assistant_LLM
+```
+
+**主程序 Python 3.12**（勿用 `.venv-rvc` 或 `vendor/CosyVoice/.venv` 运行 `main.py`）：
+
+- **已有**主环境（例如本机已配置好的 3.12 venv 或全局 `py -3.12`）：可直接用其 `python.exe`，**不必**重建。
+- **新建**隔离环境时（尚无 `.venv-main`）：
+
+```powershell
+py -3.12 -m venv .venv-main
+.\.venv-main\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+若 `.venv-main` 已存在且依赖齐全，**跳过** `pip install`。
+
+**Ollama**（当前终端只做检查，**不要**在这里长期前台运行 `ollama serve`）：
+
+```powershell
+ollama list
+```
+
+| 情况 | 处理 |
 |------|------|
-| **LLM 对话** | 通过 [Ollama](https://ollama.com/) 调用本地模型（默认 `Miku_Assistant-emotion:latest`） |
-| **文字转语音 (TTS)** | edge-tts 在线合成 → MP3 转 WAV → 可选 RVC 音色转换 |
-| **语音转文字 (STT)** | 麦克风输入，基于 SpeechRecognition + PyAudio |
-| **语音模式** | 回复期间持续监听；助手回声、语气词和极短噪声转写会被过滤，有效插话可取消当前生成/播报 |
-| **RVC 加速** | 常驻 **Worker** 只加载一次模型；有 NVIDIA GPU 时 **CUDA** 推理；Worker 故障默认回退普通音色以避免重复冷启动 |
-| **系统控制** | 关机 / 重启 / 锁屏（弹窗二次确认） |
-| **网页搜索** | Google / Bing / Baidu，支持 B 站搜索与打开首页 |
-| **安全策略** | 集中式权限控制，注册表写入永久禁止 |
-| **日志与清理** | 运行日志写入 `logs/`，临时/测试文件自动清理 |
+| **`ollama list` 连接失败** | 在**另一个终端**启动 `ollama serve`，再回到本终端重试 `ollama list` |
+| **能连上但列表为空** | 需自行 `pull` / `ollama create` 准备模型；**再开一个 `serve` 不会自动出现模型** |
+
+`ollama list` 只说明**本机已安装**哪些模型名。助手**实际调用**哪一个是 [`config/config.yaml`](config/config.yaml) 的 **`ollama.model`**，启动成功时也会在日志中打印；请把该键设为列表里**存在**的名称（默认可为 `Miku_Assistant-emotion:latest`，须你已安装）。
+
+**可选 RVC 权重**：`src/voice/Nahida/`（不入库）。需要时再阅读 [`scripts/setup_voice_env.ps1`](scripts/setup_voice_env.ps1)。
+
+启动（示例使用 `.venv-main`；若你用其它 3.12 解释器，替换为同一路径）：
+
+```powershell
+.\.venv-main\Scripts\python.exe main.py
+```
 
 ---
 
-## 系统要求
+## 运行模式与命令
 
-| 项目 | 说明 |
+以下示例均使用 **`.\.venv-main\Scripts\python.exe`**（请换成你实际的主程序 3.12 解释器路径）：
+
+| 命令 | 说明 |
 |------|------|
-| **操作系统** | Windows 10 / 11（系统控制、RVC 安装脚本面向 Windows） |
-| **Python 3.12** | 主程序 |
-| **Python 3.11** | RVC 独立环境 `.venv-rvc`（使用 Nahida 音色时需要） |
-| **Ollama** | 已安装并运行（`ollama serve`） |
-| **麦克风** | 语音模式需要 |
-| **网络** | edge-tts 与 LLM 需要；可选 pyttsx3 作为离线 TTS 应急 |
-| **GPU（可选）** | NVIDIA + CUDA 12.x 可显著加速 RVC（如 RTX 40 系列） |
+| `.\.venv-main\Scripts\python.exe main.py` | 默认 **interactive** |
+| `.\.venv-main\Scripts\python.exe main.py --mode text` | 纯文本，**不朗读** |
+| `.\.venv-main\Scripts\python.exe main.py --mode voice` | 语音会话 |
+| `.\.venv-main\Scripts\python.exe main.py --mode interactive` | 文本 + 可切语音/TTS/stream |
+| `.\.venv-main\Scripts\python.exe main.py --config 路径\config.yaml` | 指定 YAML |
+| `.\.venv-main\Scripts\python.exe main.py --stream` | 增量显示 / 分句播报 |
+| `.\.venv-main\Scripts\python.exe main.py --auto-tts` | 打开 `assistant.auto_tts`（**不改变** `text` 模式不 TTS） |
+
+**interactive 常用输入**：`help` · `voice` / `开启语音模式` · `tts` · `stream` · `quit` / `exit` / `退出`。
+
+语音预检：麦克风、Ollama、模型存在。双工见 [`docs/architecture/adr-duplex-listening.md`](docs/architecture/adr-duplex-listening.md)、[`docs/VOICE.md`](docs/VOICE.md)。
 
 ---
 
-## 快速开始
+## 可选 RVC 与 CosyVoice
 
-### 1. 克隆仓库
+修改配置时**只合并下列键到现有 `config/config.yaml`**，**不要**用整段示例覆盖整个文件。
 
-```powershell
-git clone https://github.com/<你的用户名>/Miku_Assistant_LLM.git
-cd Miku_Assistant_LLM
-```
+### RVC（Nahida）
 
-### 2. 安装主程序依赖
+- 节点：`voice.tts.rvc.*`（`model_path`、worker、`index_rate`、`protect`、`rms_mix_rate`、`f0_method` 等）。
+- **`protect`**：**0.0–0.5**；**0.5 = 关闭保护**，更小更保护清辅音。
+- **`filter_radius`**：仅 **`f0_method=harvest`** 有效；默认 **`rmvpe`** 时不生效。
+- 仓库 YAML 示例：`pitch: 0`，`index_rate: 0.55`，`protect: 0.5`，`rms_mix_rate: 0.68`，`filter_radius: 1`，`f0_method: rmvpe`（调参不保证消除电流音）。
+- 可能加载真实设备：`diagnose_rvc.py`、`test_rvc_conversion.py`。
 
-```powershell
-py -m pip install -r requirements.txt
-```
+### CosyVoice（本地）
 
-可选离线 TTS 应急（edge-tts 不可用时自动回退）：
-
-```powershell
-py -m pip install -r requirements-optional.txt
-```
-
-### 3. 安装并配置 Ollama
-
-```powershell
-ollama serve
-ollama pull Miku_Assistant-emotion:latest
-```
-
-在 `config/config.yaml` 中修改 `ollama.model` 为你本地已有的模型名。
-
-### 4. 准备 RVC 音色模型（可选但推荐）
-
-将 Nahida RVC 模型文件放到项目中（**不会随 Git 提交**，需自行准备）：
-
-```text
-src/voice/Nahida/
-├── nahida-2h-500epoch.pth
-└── added_IVF7975_Flat_nprobe_1_v2.index
-```
-
-首次安装 RVC 推理环境（只需一次）：
-
-```powershell
-winget install Python.Python.3.11
-powershell -ExecutionPolicy Bypass -File scripts/setup_voice_env.ps1
-```
-
-有 **NVIDIA GPU** 时，安装完成后可升级为 CUDA 版 PyTorch（显著加速）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/upgrade_rvc_cuda.ps1
-```
-
-验证：
-
-```powershell
-py diagnose_rvc.py
-py test_rvc_conversion.py
-```
-
-> 若不配置 RVC，助手仍可使用 edge-tts 默认音色（晓晓）朗读。
-
-### 5. 启动助手
-
-```powershell
-py main.py
-```
-
-指定模式：
-
-```powershell
-py main.py --mode interactive   # 默认：文本 + 可切语音 + 可开关 TTS
-py main.py --mode text          # 纯文本
-py main.py --mode voice         # 纯语音
-py main.py --auto-tts           # 启动时强制开启自动朗读
-py main.py --stream             # 显式启用增量显示（当前配置默认开启）
-```
-
----
-
-## 使用说明
-
-### 交互模式（默认）
-
-启动后直接输入文字对话。常用命令：
-
-| 输入 | 作用 |
-|------|------|
-| `help` | 显示帮助 |
-| `开启语音模式` / `voice` | 进入持续语音监听 |
-| `关闭语音模式` / `退出语音` | 退出语音模式 |
-| `tts` | 切换是否自动朗读 LLM 回复 |
-| `stream` | 切换增量显示与分句播报（首句完整后即可开始 TTS） |
-| `quit` / `exit` / `退出` | 退出程序 |
-
-### 语音模式
-
-进入后对着麦克风说话即可。退出关键词：`退出`、`结束`、`quit`、`exit` 等。
-
-默认启用 `assistant.duplex_listening`：识别后增量显示回复，首句可提前 TTS；回复期间麦克风继续监听。与助手已生成文本相似的回声、重复语气音和极短转写不会创建新轮；说“停”“等等”或提出新的完整问题会取消当前生成/播报并开始新轮。关闭该配置时回到串行兼容模式，等待播报完成后再监听。
-
-当前实现是 **STT 转写后的回声与低信息门控**，不等同于声学回声消除（AEC）或语义 VAD。扬声器外放仍需真机调参，建议优先使用耳机。架构边界见 [`docs/architecture/adr-duplex-listening.md`](docs/architecture/adr-duplex-listening.md)。
-
-预检项：麦克风可用、Ollama 连接正常、模型存在。
-
-默认装配会在后台预载 Ollama 模型，并通过 `ollama.keep_alive` 保持一段时间，减少首轮或长时间空闲后的冷加载。冷启动仍可能较慢；日志中的 `[Ollama计时]` 会分别给出加载、提示词计算、生成和 token/s。`keep_alive` 会持续占用模型显存，可在 `config/config.yaml` 中缩短或设为 `0`。
-
-启用 RVC 时还会在启动阶段执行一次不播放的短推理。插话只终止活跃 RVC 推理，空闲 Worker 会保留，避免下一轮重新加载模型。`voice.tts.rvc.prewarm_audio_processing` 可选预热重采样，因首次 JIT 时间受环境影响较大而默认关闭。
-
-### 自然语言指令示例
-
-**系统控制**（会弹出确认对话框）：
-
-- 「关机」「关闭电脑」
-- 「重启」「重新启动」
-- 「锁定」「锁屏」
-
-**搜索**：
-
-- 「搜索 Python 教程」
-- 「在 b 站搜索 原神」
-- 「打开 b 站」
-
----
-
-## 架构说明
-
-```text
-用户输入 (文本/语音)
-       ↓
- IntentRouter ──→ 系统控制 / 搜索 / LLM 对话
-       ↓
- LLM 回复 (Ollama)
-       ↓
- 文本清理（去除 Markdown 星号等）
-       ↓
- edge-tts 生成 MP3
-       ↓
- MP3→WAV（40000Hz，RVC 友好采样率）
-       ↓
- RVC Worker（常驻；失败默认回退普通音色，避免逐句冷启动资源风暴）
-       ↓
- 后处理（高通 + 软限幅，减轻电流感）
-       ↓
- 分句流水线播放（长回复降低首句等待）
-       ↓
- pyttsx3 应急（edge-tts 不可用时，无 RVC）
-```
-
-| 组件 | 环境 | 说明 |
-|------|------|------|
-| 主程序 | Python 3.12 | 不安装 torch / fairseq |
-| RVC 推理 | `.venv-rvc`（Python 3.11） | `scripts/rvc_worker.py` / `scripts/rvc_infer.py` |
-| TTS 主引擎 | 主环境 | edge-tts |
-| TTS 应急 | 主环境 | pyttsx3（`requirements-optional.txt`） |
-
-详细语音文档见 [`docs/VOICE.md`](docs/VOICE.md)。
-
----
-
-## 配置
-
-主配置文件：[`config/config.yaml`](config/config.yaml)
-
-### 常用配置项
+须同时设置：
 
 ```yaml
-ollama:
-  model: "Miku_Assistant-emotion:latest"
-
 voice:
   tts:
-    engine: "edge-tts"
-    pipeline_enabled: true
-    rvc:
-      model_path: "src/voice/Nahida/nahida-2h-500epoch.pth"
-      device: "auto"              # auto | cpu | cuda:0
-      worker_enabled: true
-      worker_infer_timeout: 45
-      fallback_on_worker_failure: false  # 防止逐句冷启动造成资源风暴
-      subprocess_timeout: 90
-      index_rate: 0.55            # 略低可减少颗粒感/电流感
-      protect: 0.5                # 保护清辅音，减轻伪影
-      rms_mix_rate: 0.75
-      input_sample_rate: 40000
-      postprocess_enabled: true   # 输出高通 + 软限幅
+    engine: cosyvoice
 
-assistant:
-  auto_tts: true
-  stream_reply: true
-  duplex_listening: true       # 回复期间继续监听并允许有效插话
-  duplex_listen_timeout: 0.8
-  duplex_phrase_time_limit: 6.0
-  duplex_echo_grace_seconds: 1.0
-  duplex_min_interrupt_chars: 2
-  duplex_echo_match_ratio: 0.72
-  logging:
-    file_enabled: true
-    file_name: "miku.log"
-  file_cleanup:
-    tmp_max_age_hours: 1.0
-    logs_max_age_days: 1
-    test_max_age_hours: 72
+security:
+  permissions:
+    local_tts_worker: true
 ```
 
-### RVC 音质调参（电流感 / 伪影）
+**硬件**：生产 worker 准入要求 **NVIDIA CUDA 可用**（`src/voice/cosyvoice/worker_admission.py`；无 CUDA 返回 `cuda_unavailable`，**无** CPU 回退）。
 
-若转换后仍有轻微电流感或颗粒感，可按顺序微调 `voice.tts.rvc`：
+**固定路径**（相对仓库根，详见 [`src/voice/cosyvoice/assets.py`](src/voice/cosyvoice/assets.py)）：
 
-| 参数 | 方向 | 说明 |
-|------|------|------|
-| `index_rate` | **降低**（如 0.45~0.55） | 检索特征占比过高易出 artifacts |
-| `protect` | **略升**（如 0.5~0.55） | 保护气声与清辅音 |
-| `rms_mix_rate` | **略降**（如 0.6~0.75） | 混合更多源音量包络 |
-| `postprocess_highpass_hz` | 80~120 | 去除低频 hum |
-| `postprocess_enabled` | `false` | 对比试听，确认是否为后处理引起 |
+| 用途 | 相对路径 |
+|------|----------|
+| Worker 解释器 | `vendor/CosyVoice/.venv/Scripts/python.exe` |
+| 模型目录 | `vendor/CosyVoice/pretrained_models/CosyVoice-300M-Instruct` |
+| WeText | `vendor/CosyVoice/pretrained_models/wetext` |
+| Matcha-TTS | `vendor/CosyVoice/third_party/Matcha-TTS` |
+| Runtime worker 脚本 | `scripts/cosyvoice_runtime_worker.py` |
 
-修改后**重启助手**；Worker 会按新参数重新加载。
-
-### 安全策略
-
-`security.permissions` 控制子进程、浏览器、文件删除、系统电源等操作。  
-**注册表写入在代码层永久禁止**，无法通过配置开启。
+须在上述 venv 与 pin 资产就绪后启用；仓库**不提供**一条命令完成 Cosy 全量部署。
 
 ---
 
-## 项目结构
+## Ollama Modelfile 模板
+
+[`modelfile_manager/`](modelfile_manager/) 含 `Modelfile_v1` … `v1-3`、`Modelfile_v2-1`：
+
+| 模板 | `FROM` 基座（模板内声明） |
+|------|---------------------------|
+| **v1 系列** | `gemma3:12b` |
+| **v2-1** | 已有 **`Miku_Assistant:latest`** |
+
+模板用于人工 `ollama create` 迭代参数/人格（**不是**训练器）。**`ollama list` 仅列出已安装模型名**；助手选用哪一个由 **`config` 的 `ollama.model`** 决定，启动日志也会显示当前模型。Modelfile 里的 `FROM` 只说明 create 时需要哪些**已有**基座（例如 v1 需 `gemma3:12b`，v2-1 需 `Miku_Assistant:latest`），**不能单凭模板推断**你机器上正在跑的名字。
+
+---
+
+## 关键配置、隐私与权限
+
+主文件：[`config/config.yaml`](config/config.yaml)。
+
+| 主题 | 默认值 / 要点 |
+|------|----------------|
+| **记忆** | `memory.enabled: true`；`db_path: data/memory/long_term.sqlite3`；召回 8 / 1200 字 / 200 候选。**进程内短历史**见 `ollama.history.max_stored_turns`（默认 500），与 SQLite **长期事实**分开 |
+| **资源 / Ollama 驻留** | **`resource.ollama.unload_on_exit: false`（默认）**：退出时**不**主动 unload；配合 **`ollama.keep_alive: 30m`**，应用关闭后模型**可能仍**留在共享 Ollama 中。**`true`**：退出时对配置模型 **best-effort** 发送 `keep_alive=0`（**可能失败**或被其它客户端再次加载）；**不**停止 `ollama serve` 进程。两种设置与运行期 `keep_alive: 30m` 的请求语义并存，**并非**“30m 一定压过成功的 unload” |
+| **resource.profile** | 默认 **balanced**（另有 low_vram / aggressive_keepalive） |
+| **日志** | `assistant.logging.*`；`include_tracebacks: false` |
+| **清理** | `data/tmp` 1h、`logs/` 1d、`data/test` 72h；不递归全仓、不默认清根 `tmp/` 与 vendor 缓存 |
+
+`security.permissions` 摘录：
+
+- **false（默认）**：`registry_read`、`system_power`、`subprocess`、`os_shell`、`browser_launch`、`remote_model_endpoint`、**`insecure_remote_model_http`**、`env_modify`、**`cloud_stt`**、`local_tts_worker`
+- **true（默认）**：**`local_asr_worker`**、`cloud_tts`、`rvc_worker`、`rvc_infer`、`rvc_probe`、`file_delete`（白名单目录）
+- **`registry_write`**：仅配置占位，**代码永久拒绝**
+
+系统控制：`system.windows_control_enabled: false`，`system.require_confirmation: true`。
+
+应用层策略，**非** OS 级沙箱。
+
+---
+
+## 已验证范围（语音长测）
+
+来源：[`docs/codex-review-final-voice-soak-milestone-2026-11-05.md`](docs/codex-review-final-voice-soak-milestone-2026-11-05.md)（2026-11-05）。
+
+| 项 | 结果（特定机器 / 监督 run，**不可外推**） |
+|----|------------------------------------------|
+| 链路 | 真实 App 流式 → Ollama 12B → CosyVoice → Nahida RVC → **capture-only**（**无**麦克风/扬声器/正式 memory DB） |
+| 调度 | steady **1800s**；前 **28** 分钟 **15s** 节拍启轮，尾 **2** 分钟不启新轮（**非**连续满 30 分钟合成） |
+| 轮次/音频 | **112/112** 轮成功；**114** 段 WAV 经帧/采样率校验；最多留存 6 段 capture |
+| 延迟 | 首可播放就绪中位 **~6094ms**，P95 **~7188ms**（非声卡出声延迟） |
+| 资源 | 受控进程树 RSS 峰值 **~10448MiB（≈10.2GiB）**；约 **63GiB RAM / 16GiB GPU** 主机 |
+| 退出 | 父/子 exit 0；App/Timer/TFM/warmup/guard 等 quiet；`speech_errors=[]` |
+
+**122 + 18** 等为**特定离线门禁**计数，不是全仓 `unittest discover` 的默认预期。其它模式、低配硬件与长期泄漏需单独验证。
+
+---
+
+## 数据目录
+
+| 路径 | 内容 |
+|------|------|
+| `data/memory/long_term.sqlite3` | 正式长期记忆 |
+| `data/tmp/` | 主程序登记的部分临时音频 |
+| `data/test/` | 测试/自然度输出 |
+| `logs/miku.log` | 运行日志 |
+| `tmp/` | 开发/诊断临时（默认定时清理**不**覆盖） |
+
+---
+
+## 诊断与测试分类
+
+| 脚本 | 说明 |
+|------|------|
+| `diagnose_memory.py` | 默认 dry-run；`execute` 才连 Ollama 且用测试库 |
+| `diagnose_memory_ids.py` | 默认只读；删库需显式确认计划 |
+| `diagnose_resource_soak.py` | 离线 fake |
+| `diagnose_rvc.py` / `test_rvc_conversion.py` | 可能加载真实 RVC/设备 |
+| `diagnose_expressive_tts.py` / `diagnose_rvc_artifacts.py` | 可能加载真实 TTS/RVC |
+
+单元测试在 `tests/`（unittest + mock）。仓库内 `tmp/` 诊断监督脚本供维护者门禁使用，**不是**新用户必需步骤。
+
+开发入口：[`AGENTS.md`](AGENTS.md)、[`docs/engineering-baseline.md`](docs/engineering-baseline.md)、[`docs/architecture/`](docs/architecture/)、[`docs/VOICE.md`](docs/VOICE.md)。
+
+---
+
+## 项目结构（精简）
 
 ```text
 Miku_Assistant_LLM/
-├── main.py                      # 程序入口
-├── config/config.yaml           # 主配置
+├── main.py
+├── config/config.yaml
+├── requirements.txt
+├── modelfile_manager/
 ├── src/
-│   ├── cli/                     # 文本/语音/交互会话
-│   ├── core/                    # 助手核心、路由、配置、日志、清理
-│   ├── llm/                     # Ollama 客户端
-│   └── voice/
-│       ├── tts/engine.py        # edge-tts + 分句流水线
-│       └── rvc/                 # Worker、推理、后处理、参数
+│   ├── cli/
+│   ├── core/          # assistant、companion、路由、safety、logging_setup
+│   ├── llm/
+│   ├── memory/
+│   ├── search/ / system/
+│   └── voice/         # stt、speech_projection、tts、rvc、cosyvoice
 ├── scripts/
-│   ├── setup_voice_env.ps1      # RVC 环境一键安装
-│   ├── upgrade_rvc_cuda.ps1     # 升级 .venv-rvc 为 CUDA PyTorch
-│   ├── rvc_worker.py            # RVC 常驻 Worker（JSON 行协议）
-│   └── rvc_infer.py             # RVC 子进程 fallback
-├── docs/VOICE.md
-├── logs/                        # miku.log（自动清理）
-├── data/tmp/                    # TTS/RVC 临时音频
-├── diagnose_rvc.py
-└── test_rvc_conversion.py
+├── vendor/CosyVoice/
+├── docs/
+├── data/
+└── tests/
 ```
 
 ---
 
-## 运行时数据与日志
+## 故障排查（简表）
 
-| 路径 | 内容 | 自动清理 |
-|------|------|----------|
-| `logs/miku.log` | 运行日志（含 `[TTS计时]`） | 超过 **1 天** |
-| `data/tmp/` | `miku_*.mp3/wav` 临时音频 | 超过 **1 小时** |
-| `data/test/` | RVC 测试输出 | 超过 **72 小时** |
-
-日志同时输出到终端与文件；单文件上限 10MB，轮转保留 5 个备份。
-
----
-
-## 故障排查
-
-| 现象 | 处理 |
+| 现象 | 建议 |
 |------|------|
-| Ollama 连接失败 | 运行 `ollama serve`，检查 `base_url` |
-| 模型不存在 | `ollama list`，修改 `ollama.model` |
-| 语音模式无法启动 | 检查麦克风、PyAudio |
-| 仍是默认晓晓音色 | `py diagnose_rvc.py`，确认 RVC 环境与模型路径 |
-| RVC 很慢 | 运行 `upgrade_rvc_cuda.ps1`，`device: auto` |
-| 轻微电流感 | 降低 `index_rate`，提高 `protect`；见上文调参表 |
-| 朗读含星号 | TTS 前已自动过滤 Markdown 符号 |
-| 查看耗时 | 日志搜索 `[Ollama计时]`、`[TTS计时]`；先区分模型加载、生成、TTS、RVC 与播放 |
+| Ollama 失败 | 另开终端 `ollama serve`；核对 `base_url`、`ollama list`、`ollama.model` |
+| 模型不存在 | 改为已有模型名；Modelfile create 前确认 `FROM` 基座 |
+| 语音模式失败 | 默认 STT：**`.venv-asr`** + `vendor/paraformer-zh` pin 资产（`prepare_paraformer.py --check`）、`local_asr_worker: true`、准备后**重启**以封存 profile、内存准入（可用物理 **≥4 GiB** / commit **≥6 GiB**）、麦克风/PyAudio；**仅**显式 `engine: speech_recognition` 且 `cloud_stt: true` 时需 Google 与外网 |
+| 默认音色非 RVC | `.venv-rvc` 与 Nahida 路径；`diagnose_rvc.py` |
+| Cosy 无法启动 | CUDA 与 `assets.py` 路径、venv、`local_tts_worker` |
+| 耗时 | 日志 `[Ollama计时]`、`[TTS计时]` |
+
+测试：`MIKU_DRY_RUN=1` 禁用电源/子进程等（见 `src/core/safety.py`）。
 
 ---
 
-## 发布到 GitHub
+## 第三方组件
 
-仓库**不包含** RVC 模型（`.pth` / `.index`），克隆后需自行放入 `src/voice/Nahida/`。
+- [Ollama](https://ollama.com/)、[edge-tts](https://github.com/rany2/edge-tts)、[FunASR](https://github.com/modelscope/FunASR)、[Paraformer-zh（Hugging Face，仓库 pin  revision）](https://huggingface.co/funasr/paraformer-zh)、[rvc-python](https://github.com/JarodMica/rvc-python)、[SpeechRecognition](https://github.com/Uberi/speech_recognition)、[pygame](https://www.pygame.org/) 及 Cosy/vendor 栈等。
 
-### 首次推送（本地已有代码）
-
-```powershell
-cd D:\Miku_Assistant_LLM
-git init
-git add .
-git status   # 确认无 .pth/.index/.venv-rvc 被加入
-git commit -m "Initial commit: Miku Assistant LLM"
-```
-
-在 [GitHub 新建空仓库](https://github.com/new)（不要勾选 README），然后：
-
-```powershell
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/Miku_Assistant_LLM.git
-git push -u origin main
-```
-
-若已安装 [GitHub CLI](https://cli.github.com/)：
-
-```powershell
-gh auth login
-gh repo create Miku_Assistant_LLM --public --source=. --remote=origin --push
-```
+各组件遵循**其自身**许可；使用 RVC 权重与上游模型前请单独确认授权。
 
 ---
 
-## 开发说明
+## 许可证
 
-### 依赖
-
-- `requirements.txt` — 主程序（Python 3.12，含 librosa / scipy / soundfile）
-- `requirements-optional.txt` — pyttsx3 离线应急
-- RVC 依赖仅在 `.venv-rvc`，**不要**装入主环境
-
-### 诊断命令
-
-```powershell
-py diagnose_rvc.py
-py test_rvc_conversion.py
-
-# CUDA 是否可用（.venv-rvc）
-.venv-rvc\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
-```
-
-### 环境变量
-
-| 变量 | 作用 |
-|------|------|
-| `MIKU_DRY_RUN=1` | 禁用系统电源、子进程、Shell、浏览器（测试用） |
+仓库根目录**没有** `LICENSE` 文件：**本项目源代码的授权方式尚未在仓库中明确声明**。第三方组件的许可**不**自动等于本项目可用或再分发权限；使用前请自行核实。
 
 ---
 
-## 致谢与第三方组件
+## 已知边界
 
-- [Ollama](https://ollama.com/) — 本地 LLM
-- [edge-tts](https://github.com/rany2/edge-tts) — 微软神经网络 TTS
-- [rvc-python](https://github.com/JarodMica/rvc-python) — RVC 推理
-- [SpeechRecognition](https://github.com/Uberi/speech_recognition) — 语音识别
-- [pygame](https://www.pygame.org/) — 音频播放
+- 默认云端 TTS（edge-tts）；Whisper/Cosy 为可选重路径；**STT 默认本地 Paraformer**（须准备 `.venv-asr`）。
+- 记忆为有界启发式；**异步入库**与 **SQLite 长期事实** 不保证完整对话归档。
+- 双工插话为转写级门控；麦克风声学准入（NS/Silero guard）在 STT recognize 路径，与双工回声过滤分离；无声学 AEC。
+- `resource.profile` 不自动适配硬件；Ollama 驻留受 `keep_alive` 与 `resource.ollama.unload_on_exit` 影响。
+- 文件清理有界，不覆盖全仓与 vendor 缓存。
 
-RVC 音色模型需自行准备并遵守相应使用条款。
-
----
-
-## License
-
-本项目源代码许可证请见仓库中的 LICENSE 文件（若尚未添加，请自行补充）。  
-第三方库与 RVC 模型遵循各自协议。
+*文档与 2026-11-05 代码及 `config/config.yaml` 核对；历史 ADR 中已撤回实验不视为现行功能。*

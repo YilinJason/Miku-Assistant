@@ -314,7 +314,13 @@ class FileCleaner:
             ctx = self._scandir(rule.directory)
             iterator = iter(ctx)
         except OSError as exc:
-            self.logger.warning("无法扫描目录 %s: %s", rule.directory, exc)
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.warning(
+                "无法扫描清理目录 rule=%s err=%s",
+                rule.name,
+                exception_log_label(exc),
+            )
             return None
         sweep = _ActiveSweep(
             key=key,
@@ -392,22 +398,33 @@ class FileCleaner:
                     if self.safety_policy and not self.safety_policy.is_path_deletable(
                         file_path
                     ):
-                        self.logger.debug("跳过非白名单文件: %s", file_path)
+                        self.logger.debug(
+                            "跳过非白名单文件 rule=%s", rule.name
+                        )
                         continue
                     file_path.unlink()
                     deleted += 1
                     self.logger.debug(
-                        "删除过期[%s]: %s (%.1f小时)",
+                        "删除过期 rule=%s age_hours=%.1f",
                         rule.name,
-                        name,
                         age / 3600,
                     )
                 except OSError as exc:
+                    from src.core.log_privacy import exception_log_label
+
                     self.logger.warning(
-                        "无法删除 %s: %s", getattr(entry, "path", name), exc
+                        "无法删除过期文件 rule=%s err=%s",
+                        rule.name,
+                        exception_log_label(exc),
                     )
         except OSError as exc:
-            self.logger.warning("扫描目录失败 %s: %s", rule.directory, exc)
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.warning(
+                "扫描目录失败 rule=%s err=%s",
+                rule.name,
+                exception_log_label(exc),
+            )
             self._close_sweep(sweep.key)
             return deleted, scanned
 
@@ -434,9 +451,8 @@ class FileCleaner:
         )
         for rule in self.rules:
             self.logger.info(
-                "  - %s: %s | 保留 %s",
+                "  - rule=%s retention=%s",
                 rule.name,
-                rule.directory,
                 _format_retention(rule.max_age_seconds),
             )
         first_delay = 0.01 if self.cleanup_on_start else float(self.cleanup_interval_seconds)
@@ -449,7 +465,11 @@ class FileCleaner:
             if deleted > 0:
                 self.logger.info("自动清理完成，共删除 %d 个过期文件", deleted)
         except Exception as exc:
-            self.logger.error("自动清理失败: %s", exc)
+            from src.core.log_privacy import exception_log_label
+
+            self.logger.error(
+                "自动清理失败 err=%s", exception_log_label(exc)
+            )
             self._close_all_sweeps()
 
     def _schedule_next_cleanup(self, *, delay: Optional[float] = None) -> None:

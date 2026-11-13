@@ -262,9 +262,29 @@ class _Recognizer:
 
 
 class DefaultAdapterClassificationTests(unittest.TestCase):
-    def _engine(self, recognizer: Any, *, engine_type: str = "speech_recognition") -> STTEngine:
+    def _cloud_policy(self):
+        from src.core.safety import SafetyPolicy
+
+        return SafetyPolicy({"permissions": {"cloud_stt": True, "file_delete": True}})
+
+    def _engine(
+        self,
+        recognizer: Any,
+        *,
+        engine_type: str = "speech_recognition",
+        safety_policy: Any = ...,
+    ) -> STTEngine:
+        # Google 路径默认带 cloud_stt；Whisper 本地路径默认无策略，避免强制 TempFileManager
+        if safety_policy is ...:
+            policy = (
+                self._cloud_policy()
+                if engine_type == "speech_recognition"
+                else None
+            )
+        else:
+            policy = safety_policy
         with patch.object(STTEngine, "_initialize_engine"):
-            engine = STTEngine(engine=engine_type)
+            engine = STTEngine(engine=engine_type, safety_policy=policy)
         engine._recognizer = recognizer  # noqa: SLF001
         engine._noise_adjusted = True  # noqa: SLF001
         return engine

@@ -1,6 +1,7 @@
 """记忆增强 LLM 装饰器：system 注入 + 成功轮非阻塞提交；不改历史规则。"""
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 import uuid
@@ -180,13 +181,42 @@ class MemoryAwareLLMClient:
         else:
             _close_once()
 
-    def start_warmup(self, *, timeout: Optional[float] = None) -> Any:
+    def begin_fresh_warmup(self, *, timeout: Optional[float] = None) -> int:
+        begin = getattr(self._inner, "begin_fresh_warmup", None)
+        if not callable(begin):
+            return 0
+        try:
+            return begin(timeout=timeout)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return 0
+
+    def start_warmup(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        restart: bool = False,
+    ) -> Any:
         start = getattr(self._inner, "start_warmup", None)
         if not callable(start):
             return False
-        if timeout is None:
-            return start()
+        params = inspect.signature(start).parameters
+        if restart:
+            if "restart" not in params:
+                return False
+            return start(timeout=timeout, restart=True)
+        if "restart" in params:
+            return start(timeout=timeout, restart=False)
         return start(timeout=timeout)
+
+    def warmup_snapshot(self) -> Any:
+        snap = getattr(self._inner, "warmup_snapshot", None)
+        if callable(snap):
+            return snap()
+        from src.llm.ollama_client import OllamaWarmupSnapshot
+
+        return OllamaWarmupSnapshot(generation=0, finished=False, succeeded=False)
 
     def wait_for_warmup(self, *, timeout: Optional[float] = None) -> bool:
         wait = getattr(self._inner, "wait_for_warmup", None)

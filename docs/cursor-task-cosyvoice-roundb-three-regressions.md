@@ -1,0 +1,13 @@
+# B独立复验：三项必须修复
+
+前一轮eea96011完成大部分边界，但Codex独立探针`tmp/codex_cosy_b_final_probe.py`实际返回：fd_leaked_on_identity_mismatch=1；spawn_orphaned_worker_reported_complete=true；expired_deadline_sent_termination=false。不得进入C。只修以下三项及直接调用点/测试，不扩大范围。沿用AGENTS安全/协作约束，无真实模型设备/data-memory/配置/提交推送。
+
+1. `output_verify.py`打开fd后，fstat mismatch/size mismatch直接returnFalse，except不执行所以fd泄漏。整个打开后的作用域必须try/finally无条件关闭未移交fd；成功fdopen后移交所有权，任何提前return/异常均关闭一次。加patch捕获fd的行为回归，身份不符/大小不符/fstat异常/正常WAV均assert该fd已关闭。普通WAV格式也明确检查，不只是soundfile可读。
+
+2. `_start_worker_poll`在spawn返回后发现closing/epoch变化时，当前仅close管道/terminate并return，proc从未赋给owner；terminate失败或尚未退出时shutdown仍complete、第二client可建。禁止本地变量丢进程。先在生命周期保护下登记proc（禁止ready），再通过同一有界停止链terminate→kill→wait确认，未退出保留proc和stop_failed并保持registry；spawn/startup owner一直到已登记/已回收的交接完成。不能在活进程上先同步close pipe（可能阻塞）。ready/closing与owner发布使用一致锁/epoch保护。加假Popen在shutdown之后返回且terminate/kill均不退出的测试，assert第二client拒绝、complete=false/proc仍可观察，随后fake允许退出后shutdown重试complete；不得手动proc.stop替生产回收。
+
+3. `_stop_worker_until`当deadline已过直接return，但synthesize的write timeout恰好把已过deadline传入。因此超时后worker仍执行GPU任务且没有terminate。预算用尽不能跳过终止信号：至少对当前owned proc发送非阻塞terminate/kill，不做无预算wait/join；有预算时按原阶段有界wait；否则保留引用/incomplete禁止重建供下次shutdown重试。生命周期锁获取失败也保留owner，不能清除引用。补真实client synth阻塞写直到1秒timeout后，验证确实已发终止；另测deadline已过直接停止，返回快、信号发出且未退出owner保留。无无限额外wait。
+
+执行Codex final probe只允许导入/接口迁移最小适配，不得改变预期含义；其关闭后spawn的fake wait方法需合理有界TimeoutExpired以模拟停止失败，不得删该场景。
+
+专项A+B先一次（90秒supervisor，UTF8+errors=replace，记录完整stderr与returncode），通过后全量一次180秒，diff/compile。代码自查这三项后更新handoff，停止待Codex独立复验。不要反复全量只为了计数；不要把其他测试状态当三项闭环。

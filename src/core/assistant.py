@@ -18,12 +18,12 @@ from src.core.assembly import (
     build_stt_engine,
     build_tts_engine,
     build_voice_engines,
-    _shutdown_engine,
 )
 from src.core.dispatch_outcome import DispatchOutcome, ReplyStage
 from src.core.handlers.llm_handler import LLMIntentHandler
+from src.core.log_privacy import exception_log_label
 from src.core.perf_timing import SessionTimer
-from src.core.resource_coord import release_owned_ollama_model, run_coordinated_warmup
+from src.core.resource_coord import release_owned_ollama_model
 from src.core.resource_settings import ResourceSettings, parse_resource_settings
 from src.core.router import IntentRouter
 from src.core.router_factory import build_intent_router
@@ -34,6 +34,20 @@ from src.core.startup_mode import StartupMode, normalize_startup_mode
 from src.llm.generate_result import GenerateResult, GenerateStatus
 from src.llm.stream_events import StreamEventKind
 from src.voice.recognition import RecognitionResult, RecognitionStatus
+from src.voice.speech_projection import SpeechProjector, project_for_speech
+from src.core.shutdown_status import (
+    engine_declares_aggregate_shutdown_status,
+    engine_declares_local_cosyvoice_shutdown_status,
+    verify_aggregate_shutdown_status,
+)
+from src.core.voice_load_lane import ensure_voice_transaction, shutdown_retire_owner_in_lane
+from src.core.voice_activation import (
+    UnpublishedVoice,
+    bound_rvc_explicit_retry_needed,
+    bound_tts_models_ready,
+    is_cosyvoice_tts,
+    warmup_registered_tts_candidate,
+)
 
 
 @dataclass
@@ -41,12 +55,16 @@ class VoiceStackLoadResult:
     """首次进入语音时懒加载结果；失败为结构化报告，不抛裸异常。"""
 
     ok: bool = False
+    pending: bool = False
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = ["语音栈加载:"]
-        lines.append(f"  状态: {'通过' if self.ok else '未通过'}")
+        if self.pending:
+            lines.append("  状态: 准备中")
+        else:
+            lines.append(f"  状态: {'通过' if self.ok else '未通过'}")
         for err in self.errors:
             lines.append(f"  [错误] {err}")
         for warn in self.warnings:
@@ -65,6 +83,7 @@ class _GenerationTurn:
     turn_id: int
     cancel: threading.Event = field(default_factory=threading.Event)
     speech_turn_id: int = 0
+    speech_projector: Any = field(default=None, repr=False)
 
 
 class MikuAssistant:
@@ -80,8 +99,8 @@ class MikuAssistant:
             - ``file_cleaner.stop_auto_cleanup()``；成功后再 ``cleanup_now()``
               （停止失败则跳过末次清理，仍关闭角色）
             - ``character_interface.close()``
-        单步异常记录后继续；整次流程只跑一轮，再次 ``shutdown()`` 不重复、不重试。
-        全部成功才记「助手已关闭」；否则记「关闭流程已结束但部分资源释放失败」。
+        单步异常记录后继续；已完成步骤不重复执行，未实际完成的关闭步骤可在后续 ``shutdown()`` 中重试。
+        全部成功时记「助手已关闭」；否则记错误级关闭摘要（含可再次 ``shutdown()`` 重试），不以成功日志掩盖失败。
         由调用方管理（助手不关闭）：
             - ``config``、``safety_policy``、``llm_client``、``stt_engine``、
               ``windows_controller``、``chrome_searcher``、``router``
@@ -118,7 +137,11 @@ class MikuAssistant:
             )
             parts = assemble_default(config_path, startup_mode=mode)
         except Exception as exc:
-            logging.getLogger(__name__).error("模块初始化失败: %s", exc, exc_info=True)
+            logging.getLogger(__name__).error(
+                "模块初始化失败 err=%s",
+                exception_log_label(exc),
+                exc_info=True,
+            )
             raise
         self._bind_parts(parts)
 
@@ -189,6 +212,11 @@ class MikuAssistant:
         self.file_cleaner = parts.file_cleaner
         self.router = parts.router
         self.memory_runtime = getattr(parts, "memory_runtime", None)
+        self._model_memory_admission = getattr(
+            parts, "model_memory_admission", None
+        )
+        self._temp_file_manager = getattr(parts, "temp_file_manager", None)
+        self.temp_file_manager = self._temp_file_manager
         self.startup_mode: StartupMode = getattr(parts, "startup_mode", "interactive")
         self.resource_settings: ResourceSettings = (
             getattr(parts, "resource_settings", None)
@@ -203,10 +231,18 @@ class MikuAssistant:
             self.logger = parts.logger
         else:
             self.logger = logging.getLogger(__name__)
-        # 关闭流程幂等：整次 shutdown 只执行一轮步骤，失败步骤不在再次调用时重试
-        # memory 未完成关闭时允许后续 shutdown 仅重试 memory close
+        # 关闭流程：已完成组件 exactly-once；未完成项（含播报超时）可有界重试
         self._shutdown_flow_done = False
         self._non_memory_shutdown_done = False
+        self._speech_shutdown_done = False
+        self._tts_shutdown_done = False
+        self._stt_shutdown_done = False
+        self._temp_shutdown_done = False
+        self._file_cleaner_shutdown_done = False
+        self._character_shutdown_done = False
+        self._model_memory_guard_shutdown_done = False
+        self._llm_warmup_shutdown_done = False
+        self._llm_warmup_owner = getattr(parts, "llm_warmup_owner", None)
         self._speech_player = None
         self._shutting_down = False
         self._turn_seq = 0
@@ -222,6 +258,16 @@ class MikuAssistant:
         self._owned_stt = False
         self._tts_load_failed = False
         self._tts_fail_notified = False
+        self._local_voice_prepare_ok = False
+        self._voice_load_cancel = threading.Event()
+        self._voice_owner_slot: Optional[UnpublishedVoice] = None
+        self._voice_lane_ticket = 0
+        self._voice_lane_holder: Optional[int] = None
+        self._fg_lock = threading.Lock()
+        self._fg_generation = 0
+        self._fg_active_job: Optional[Any] = None
+        self._fg_sticky_failure: Optional[VoiceStackLoadResult] = None
+        self._fg_deadline_mono = 0.0
 
     def _lifecycle_closed(self) -> bool:
         return bool(self._shutting_down or self._non_memory_shutdown_done)
@@ -254,351 +300,118 @@ class MikuAssistant:
             self._voice_load_cv.wait(timeout=remaining)
         return None
 
-    def _discard_unpublished_tts(self, tts: Any) -> None:
-        """
-        回收本轮未发布 TTS。
+    def _bound_tts_ready(self) -> bool:
+        return bound_tts_models_ready(
+            self.tts_engine,
+            local_prepare_ok=self._local_voice_prepare_ok,
+            resource_settings=self.resource_settings,
+        )
 
-        尚无正式 TTS 时本实例可能已预热全局 RVC，必须 ``stop_rvc=True``；
-        已有正式 TTS 时不得停其 Worker（``stop_rvc=False``）。
-        """
-        stop_rvc = self.tts_engine is None
-        _shutdown_engine(tts, stop_rvc=stop_rvc)
+    def _edge_playback_satisfied(self) -> bool:
+        tts = self.tts_engine
+        if tts is None or is_cosyvoice_tts(tts):
+            return False
+        from src.core.voice_activation import edge_rvc_warmup_required
+
+        if edge_rvc_warmup_required(tts, self.resource_settings):
+            return self._bound_tts_ready()
+        return True
 
     def ensure_tts_for_playback(self, *, allow_retry: bool = False) -> VoiceStackLoadResult:
-        """
-        交互/文本路径首次真正需要播报时懒加载 TTS（不必同时加载 STT）。
-
-        ``allow_retry=True`` 用于用户显式 ``tts`` 命令，可清除本会话自动失败封锁。
-        关闭开始后即使旧引擎仍绑定也返回结构化失败。
-        """
+        """懒加载 TTS（可选显式重试）。"""
         with self._lifecycle_lock:
             if self._lifecycle_closed():
                 return VoiceStackLoadResult(
                     ok=False, errors=["助手正在关闭，无法加载 TTS"]
                 )
-            if self.tts_engine is not None:
-                return VoiceStackLoadResult(ok=True)
-            if self._tts_load_failed and not allow_retry:
-                return VoiceStackLoadResult(
-                    ok=False,
-                    errors=["TTS 先前加载失败；请输入 tts 显式重试"],
-                )
-            if allow_retry:
-                self._tts_load_failed = False
-                self._tts_fail_notified = False
-            if not self._voice_autoload_enabled:
-                return VoiceStackLoadResult(
-                    ok=False,
-                    errors=[
-                        "TTS 未装配且注入路径禁止自动创建。"
-                        "请注入 tts_engine 或使用可懒加载的 startup_mode。"
-                    ],
-                )
+            if self.tts_engine is not None and not is_cosyvoice_tts(self.tts_engine):
+                if self._edge_playback_satisfied():
+                    if not (
+                        allow_retry
+                        and bound_rvc_explicit_retry_needed(
+                            self.tts_engine, self.resource_settings
+                        )
+                    ):
+                        from src.core.voice_activation import voice_stack_load_ok
 
-        with self._voice_loader_lock:
-            waited = self._wait_while_voice_loading_locked(label="TTS")
-            if waited is not None:
-                return waited
-            with self._lifecycle_lock:
-                if self._lifecycle_closed():
-                    return VoiceStackLoadResult(
-                        ok=False, errors=["助手正在关闭，无法加载 TTS"]
-                    )
-                if self.tts_engine is not None:
-                    return VoiceStackLoadResult(ok=True)
-                if self._tts_load_failed and not allow_retry:
-                    return VoiceStackLoadResult(
-                        ok=False,
-                        errors=["TTS 先前加载失败；请输入 tts 显式重试"],
-                    )
-                if allow_retry:
-                    self._tts_load_failed = False
-                    self._tts_fail_notified = False
-            self._voice_loading = True
-
-        tts: Any = None
-        try:
-            tts_cls = self._tts_engine_cls
-            kwargs = {}
-            if tts_cls is not None:
-                kwargs["tts_engine_cls"] = tts_cls
-            tts = build_tts_engine(
-                self.config,
-                self.safety_policy,
-                warm_rvc_on_init=False,
-                **kwargs,
-            )
-            run_coordinated_warmup(
-                llm_client=self.llm_client,
-                tts_engine=tts,
-                settings=self.resource_settings,
-                log=self.logger,
-            )
-            with self._lifecycle_lock:
-                if self._lifecycle_closed():
-                    self._discard_unpublished_tts(tts)
-                    tts = None
-                    return VoiceStackLoadResult(
-                        ok=False, errors=["助手正在关闭，已丢弃新建 TTS"]
-                    )
-                if self.tts_engine is not None:
-                    self._discard_unpublished_tts(tts)
-                    tts = None
-                    return VoiceStackLoadResult(ok=True)
-                self.tts_engine = tts
-                self._owned_tts = True
-                self._tts_load_failed = False
-                tts = None
-                self.logger.info(
-                    "TTS 按需懒加载完成 session=%s",
-                    self.session_timer.session_id,
-                )
-                return VoiceStackLoadResult(ok=True)
-        except (KeyboardInterrupt, SystemExit):
-            self._discard_unpublished_tts(tts)
-            raise
-        except Exception as exc:
-            self._discard_unpublished_tts(tts)
-            self._tts_load_failed = True
-            self.logger.error("TTS 懒加载失败: %s", exc, exc_info=True)
-            return VoiceStackLoadResult(
-                ok=False, errors=[f"TTS 初始化失败: {exc}"]
-            )
-        finally:
-            with self._voice_loader_lock:
-                self._voice_loading = False
-                self._voice_load_cv.notify_all()
+                        return voice_stack_load_ok(
+                            self.tts_engine,
+                            resource_settings=self.resource_settings,
+                        )
+        return ensure_voice_transaction(
+            self,
+            want_tts=True,
+            want_stt=False,
+            allow_retry=allow_retry,
+            lane_label="TTS",
+        )
 
     def ensure_voice_stack(self) -> VoiceStackLoadResult:
-        """
-        确保 STT/TTS 已就绪；``text``/``interactive`` 首次进入语音时懒加载。
-
-        两者皆缺时在同一 single-flight 事务中构造并一次发布；已有 TTS 仅缺 STT
-        时只补 STT。关闭开始后即使旧对象仍绑定也返回失败。
-        """
+        """确保 STT/TTS 就绪（同步事务）。"""
         with self._lifecycle_lock:
             if self._lifecycle_closed():
                 return VoiceStackLoadResult(
                     ok=False, errors=["助手正在关闭，无法加载语音栈"]
                 )
-            if self.stt_engine is not None and self.tts_engine is not None:
-                return VoiceStackLoadResult(ok=True)
-            need_tts = self.tts_engine is None
-            need_stt = self.stt_engine is None
-            if not need_tts and not need_stt:
-                return VoiceStackLoadResult(ok=True)
-            if not self._voice_autoload_enabled:
-                if self.stt_engine is not None and self.tts_engine is None:
-                    return VoiceStackLoadResult(
-                        ok=True,
-                        warnings=["TTS 引擎未初始化（识别预检可通过，播报将不可用）"],
-                    )
+            if (
+                not self._voice_autoload_enabled
+                and self.stt_engine is not None
+                and self.tts_engine is None
+            ):
                 return VoiceStackLoadResult(
-                    ok=False,
-                    errors=[
-                        "语音栈未装配且注入路径禁止自动创建真实 TTS/STT。"
-                        "请使用 startup_mode=voice 装配，或注入引擎后再进入语音。"
-                    ],
+                    ok=True,
+                    warnings=["TTS 引擎未初始化（识别预检可通过，播报将不可用）"],
                 )
+            if (
+                self.tts_engine is not None
+                and self.stt_engine is not None
+                and not is_cosyvoice_tts(self.tts_engine)
+            ):
+                if self._edge_playback_satisfied():
+                    from src.core.voice_activation import voice_stack_load_ok
 
-        if need_tts and not need_stt:
-            return self.ensure_tts_for_playback()
-
-        if need_stt and not need_tts:
-            return self._ensure_stt_only()
-
-        return self._ensure_voice_stack_both()
-
-    def _ensure_voice_stack_both(self) -> VoiceStackLoadResult:
-        """两者皆缺：局部构造 TTS+STT，成功后一次发布；失败回收本轮 TTS/RVC。"""
-        with self._lifecycle_lock:
-            if self._lifecycle_closed():
-                return VoiceStackLoadResult(
-                    ok=False, errors=["助手正在关闭，无法加载语音栈"]
-                )
-            if self.tts_engine is not None and self.stt_engine is not None:
-                return VoiceStackLoadResult(ok=True)
-            route_stt_only = (
-                self.tts_engine is not None and self.stt_engine is None
-            )
-            route_tts_only = (
-                self.stt_engine is not None and self.tts_engine is None
-            )
-            if not self._voice_autoload_enabled and self.tts_engine is None:
-                return VoiceStackLoadResult(
-                    ok=False, errors=["语音栈未装配且禁止自动创建"]
-                )
-        # 不得在持有 lifecycle 时进入窄路径（其内可能 wait loader）
-        if route_stt_only:
-            return self._ensure_stt_only()
-        if route_tts_only:
-            return self.ensure_tts_for_playback()
-
-        with self._voice_loader_lock:
-            waited = self._wait_while_voice_loading_locked(label="语音栈")
-            if waited is not None:
-                return waited
-            with self._lifecycle_lock:
-                if self._lifecycle_closed():
-                    return VoiceStackLoadResult(
-                        ok=False, errors=["助手正在关闭，无法加载语音栈"]
+                    return voice_stack_load_ok(
+                        self.tts_engine,
+                        resource_settings=self.resource_settings,
                     )
-                if self.tts_engine is not None and self.stt_engine is not None:
-                    return VoiceStackLoadResult(ok=True)
-                route_stt_only = (
-                    self.tts_engine is not None and self.stt_engine is None
-                )
-                route_tts_only = (
-                    self.stt_engine is not None and self.tts_engine is None
-                )
-            if route_stt_only or route_tts_only:
-                pass
-            else:
-                self._voice_loading = True
+        return ensure_voice_transaction(
+            self,
+            want_tts=True,
+            want_stt=True,
+            allow_retry=False,
+            lane_label="语音栈",
+        )
 
-        if route_stt_only:
-            return self._ensure_stt_only()
-        if route_tts_only:
-            return self.ensure_tts_for_playback()
+    def request_tts_for_playback(
+        self,
+        *,
+        allow_retry: bool = False,
+        wait: bool = True,
+        wait_sec: Optional[float] = None,
+    ) -> VoiceStackLoadResult:
+        from src.core.voice_foreground import request_tts_for_playback
 
-        tts: Any = None
-        stt: Any = None
-        try:
-            tts_cls = self._tts_engine_cls
-            stt_cls = self._stt_engine_cls
-            tts_kwargs: dict = {}
-            stt_kwargs: dict = {}
-            if tts_cls is not None:
-                tts_kwargs["tts_engine_cls"] = tts_cls
-            if stt_cls is not None:
-                stt_kwargs["stt_engine_cls"] = stt_cls
-            tts = build_tts_engine(
-                self.config,
-                self.safety_policy,
-                warm_rvc_on_init=False,
-                **tts_kwargs,
-            )
-            try:
-                stt = build_stt_engine(self.config, **stt_kwargs)
-            except Exception:
-                self._discard_unpublished_tts(tts)
-                tts = None
-                raise
-            run_coordinated_warmup(
-                llm_client=self.llm_client,
-                tts_engine=tts,
-                settings=self.resource_settings,
-                log=self.logger,
-            )
-            with self._lifecycle_lock:
-                if self._lifecycle_closed():
-                    self._discard_unpublished_tts(tts)
-                    tts = None
-                    stt = None
-                    return VoiceStackLoadResult(
-                        ok=False, errors=["助手正在关闭，已丢弃新建语音栈"]
-                    )
-                if self.tts_engine is not None and self.stt_engine is not None:
-                    self._discard_unpublished_tts(tts)
-                    tts = None
-                    stt = None
-                    return VoiceStackLoadResult(ok=True)
-                if self.tts_engine is None:
-                    self.tts_engine = tts
-                    self._owned_tts = True
-                    self._tts_load_failed = False
-                    tts = None
-                else:
-                    self._discard_unpublished_tts(tts)
-                    tts = None
-                if self.stt_engine is None:
-                    self.stt_engine = stt
-                    self._owned_stt = True
-                    stt = None
-                else:
-                    stt = None
-                self.logger.info(
-                    "语音栈懒加载完成 startup_mode=%s session=%s",
-                    self.startup_mode,
-                    self.session_timer.session_id,
-                )
-                return VoiceStackLoadResult(ok=True)
-        except (KeyboardInterrupt, SystemExit):
-            self._discard_unpublished_tts(tts)
-            raise
-        except Exception as exc:
-            self._discard_unpublished_tts(tts)
-            self.logger.error("语音栈懒加载失败: %s", exc, exc_info=True)
-            return VoiceStackLoadResult(
-                ok=False, errors=[f"语音栈初始化失败: {exc}"]
-            )
-        finally:
-            with self._voice_loader_lock:
-                self._voice_loading = False
-                self._voice_load_cv.notify_all()
+        return request_tts_for_playback(
+            self,
+            allow_retry=allow_retry,
+            wait=wait,
+            wait_sec=wait_sec,
+        )
 
-    def _ensure_stt_only(self) -> VoiceStackLoadResult:
-        """仅构造并发布 STT；不触碰已有 TTS / RVC。"""
-        with self._lifecycle_lock:
-            if self._lifecycle_closed():
-                return VoiceStackLoadResult(
-                    ok=False, errors=["助手正在关闭，无法加载 STT"]
-                )
-            if self.stt_engine is not None:
-                return VoiceStackLoadResult(ok=True)
-            if not self._voice_autoload_enabled:
-                return VoiceStackLoadResult(
-                    ok=False, errors=["STT 未装配且禁止自动创建"]
-                )
+    def request_voice_stack(
+        self,
+        *,
+        wait: bool = True,
+        wait_sec: Optional[float] = None,
+    ) -> VoiceStackLoadResult:
+        from src.core.voice_foreground import request_voice_stack
 
-        with self._voice_loader_lock:
-            waited = self._wait_while_voice_loading_locked(label="STT")
-            if waited is not None:
-                return waited
-            with self._lifecycle_lock:
-                if self._lifecycle_closed():
-                    return VoiceStackLoadResult(
-                        ok=False, errors=["助手正在关闭，无法加载 STT"]
-                    )
-                if self.stt_engine is not None:
-                    return VoiceStackLoadResult(ok=True)
-            self._voice_loading = True
+        return request_voice_stack(self, wait=wait, wait_sec=wait_sec)
 
-        stt: Any = None
-        try:
-            stt_cls = self._stt_engine_cls
-            kwargs = {}
-            if stt_cls is not None:
-                kwargs["stt_engine_cls"] = stt_cls
-            stt = build_stt_engine(self.config, **kwargs)
-            with self._lifecycle_lock:
-                if self._lifecycle_closed():
-                    stt = None
-                    return VoiceStackLoadResult(
-                        ok=False, errors=["助手正在关闭，已丢弃新建 STT"]
-                    )
-                if self.stt_engine is not None:
-                    stt = None
-                    return VoiceStackLoadResult(ok=True)
-                self.stt_engine = stt
-                self._owned_stt = True
-                stt = None
-                self.logger.info(
-                    "STT 按需懒加载完成 session=%s",
-                    self.session_timer.session_id,
-                )
-                return VoiceStackLoadResult(ok=True)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:
-            self.logger.error("STT 懒加载失败: %s", exc, exc_info=True)
-            return VoiceStackLoadResult(
-                ok=False, errors=[f"STT 初始化失败: {exc}"]
-            )
-        finally:
-            with self._voice_loader_lock:
-                self._voice_loading = False
-                self._voice_load_cv.notify_all()
+    def _playback_tts_ready(self) -> bool:
+        from src.core.voice_foreground import app_tts_playback_ready
+
+        return app_tts_playback_ready(self)
 
     @staticmethod
     def check_mode_switch(text: str) -> Optional[str]:
@@ -737,22 +550,31 @@ class MikuAssistant:
             assert llm is not None
             player = None
             if use_tts:
-                tts_ready = self.ensure_tts_for_playback()
-                if not tts_ready.ok and not self._tts_fail_notified:
+                tts_ready = self.request_tts_for_playback(wait=False)
+                if (
+                    (not tts_ready.ok or tts_ready.pending)
+                    and not self._tts_fail_notified
+                ):
                     self._tts_fail_notified = True
                     self.logger.warning(
-                        "流式播报跳过：TTS 不可用 errors=%s", tts_ready.errors
+                        "流式播报跳过：TTS 不可用 error_count=%s",
+                        len(tts_ready.errors),
                     )
-            if use_tts and self.tts_engine:
+            if use_tts and self._playback_tts_ready():
                 # token 归属与播报 begin_turn 同一临界区；失去所有权则不得 begin_turn
                 player = self._claim_speech_for_turn(turn, cancel_event)
             if not self._turn_is_active(turn, cancel_event):
                 self._release_own_speech(turn)
                 return DispatchOutcome.cancelled()
 
-            splitter = IncrementalSentenceSplitter(
-                max_buffer=int(self.config.get("assistant.stream_sentence_max_buffer", 500))
+            _stream_max_buf = int(
+                self.config.get("assistant.stream_sentence_max_buffer", 500)
             )
+            splitter = IncrementalSentenceSplitter(
+                max_buffer=_stream_max_buf,
+                first_clause_min_chars=min(12, _stream_max_buf),
+            )
+            turn.speech_projector = SpeechProjector()
             stream = llm.generate_stream(text)
             stream_iter = iter(stream)
             generation_started = time.perf_counter()
@@ -770,16 +592,26 @@ class MikuAssistant:
             received_terminal = False
 
             def _try_enqueue(sentence: str) -> bool:
-                """入队；仅在本轮确有受管理播放器且句子被接受时标记可能在播。"""
+                """入队投影后文本；空投影视为成功跳过，不置 speech_started。"""
                 nonlocal speech_started
-                ok = self._enqueue_sentence(player, turn, sentence, cancel_event)
-                if (
-                    ok
-                    and player is not None
-                    and bool(turn.speech_turn_id)
-                    and sentence
-                    and sentence.strip()
-                ):
+                spoken = self._project_sentence_for_turn(turn, sentence)
+                if not spoken:
+                    return True
+                ok = self._enqueue_spoken(player, turn, spoken, cancel_event)
+                if ok and player is not None and bool(turn.speech_turn_id):
+                    speech_started = True
+                return ok
+
+            def _flush_projector() -> bool:
+                nonlocal speech_started
+                projector = turn.speech_projector
+                if projector is None:
+                    return True
+                spoken = projector.finish()
+                if not spoken:
+                    return True
+                ok = self._enqueue_spoken(player, turn, spoken, cancel_event)
+                if ok and player is not None and bool(turn.speech_turn_id):
                     speech_started = True
                 return ok
 
@@ -866,6 +698,8 @@ class MikuAssistant:
                             if not _try_enqueue(sentence):
                                 playback_failed = True
                                 break
+                        if not playback_failed and not _flush_projector():
+                            playback_failed = True
 
                         if playback_failed or _consumer_failed_ours():
                             self._release_own_speech(turn)
@@ -1043,6 +877,8 @@ class MikuAssistant:
                 return None
             if self.tts_engine is None:
                 return None
+            if not self._playback_tts_ready():
+                return None
             player = self._ensure_speech_player()
             if self._active_turn is not turn or turn.cancel.is_set():
                 return None
@@ -1095,14 +931,25 @@ class MikuAssistant:
             DispatchOutcome(text="", allow_tts=False, allow_character=False),
         )
 
-    def _enqueue_sentence(
+    def _project_sentence_for_turn(self, turn: _GenerationTurn, sentence: str) -> str:
+        """对本轮句子做朗读投影；无 projector 时退回完整投影。"""
+        raw = self.strip_assistant_prefix(sentence)
+        projector = turn.speech_projector
+        if projector is not None:
+            return projector.feed(raw)
+        return project_for_speech(raw)
+
+    def _enqueue_spoken(
         self,
         player: Optional[TurnSpeechPlayer],
         turn: _GenerationTurn,
-        sentence: str,
+        spoken: str,
         external_cancel: Optional[threading.Event],
     ) -> bool:
+        """已投影文本入队；空串成功跳过。"""
         if player is None:
+            return True
+        if not spoken or not spoken.strip():
             return True
         if not self._turn_is_active(turn, external_cancel):
             return False
@@ -1114,10 +961,20 @@ class MikuAssistant:
             return False
         return player.enqueue(
             turn.speech_turn_id,
-            self.strip_assistant_prefix(sentence),
+            spoken,
             cancel_event=turn.cancel,
             extra_cancel=external_cancel,
         )
+
+    def _enqueue_sentence(
+        self,
+        player: Optional[TurnSpeechPlayer],
+        turn: _GenerationTurn,
+        sentence: str,
+        external_cancel: Optional[threading.Event],
+    ) -> bool:
+        spoken = self._project_sentence_for_turn(turn, sentence)
+        return self._enqueue_spoken(player, turn, spoken, external_cancel)
 
     def _ensure_speech_player(self) -> TurnSpeechPlayer:
         if self._shutting_down:
@@ -1148,26 +1005,49 @@ class MikuAssistant:
         response = outcome.text
         if use_tts and outcome.allow_tts:
             if self.tts_engine is None and self._voice_autoload_enabled:
-                load = self.ensure_tts_for_playback()
-                if not load.ok and not self._tts_fail_notified:
+                load = self.request_tts_for_playback(wait=False)
+                if (
+                    (not load.ok or load.pending)
+                    and not self._tts_fail_notified
+                ):
                     self._tts_fail_notified = True
                     self.logger.warning(
-                        "自动播报跳过：TTS 不可用 errors=%s", load.errors
+                        "自动播报跳过：TTS 不可用 error_count=%s",
+                        len(load.errors),
                     )
-            if self.tts_engine:
-                tts_text = self.strip_assistant_prefix(response)
-                if use_legacy_thread:
-                    try:
-                        threading.Thread(
-                            target=self.tts_engine.speak,
-                            args=(tts_text,),
-                            daemon=True,
-                        ).start()
-                    except Exception as exc:
-                        self.logger.error("启动音频播放线程失败: %s", exc)
-                        self.tts_engine.speak(tts_text)
+            if self._playback_tts_ready():
+                spoken = project_for_speech(self.strip_assistant_prefix(response))
+                if not spoken:
+                    pass
+                elif use_legacy_thread:
+                    if turn is None:
+                        self.logger.warning("非流播报跳过：缺少轮次上下文")
+                    else:
+                        try:
+                            player = self._claim_speech_for_turn(turn, None)
+                            if player is not None and turn.speech_turn_id:
+                                ok = player.enqueue(
+                                    turn.speech_turn_id,
+                                    spoken,
+                                    cancel_event=turn.cancel,
+                                    extra_cancel=None,
+                                )
+                                if ok:
+                                    player.mark_production_finished(turn.speech_turn_id)
+                                else:
+                                    self._release_own_speech(turn)
+                                    self.logger.warning("非流播报入队失败")
+                        except BaseException as exc:
+                            if turn.speech_turn_id:
+                                self._release_own_speech(turn)
+                            if not isinstance(exc, Exception):
+                                raise
+                            self.logger.error(
+                                "非流播报失败 err=%s",
+                                exception_log_label(exc),
+                            )
                 else:
-                    self.tts_engine.speak(tts_text)
+                    self.tts_engine.speak(spoken)
 
         if (
             outcome.allow_character
@@ -1198,11 +1078,11 @@ class MikuAssistant:
             turn, cancel_event
         ):
             if self.tts_engine is None and self._voice_autoload_enabled:
-                self.ensure_tts_for_playback()
+                self.request_tts_for_playback(wait=False)
         if not (
             use_tts
             and outcome.allow_tts
-            and self.tts_engine
+            and self._playback_tts_ready()
             and outcome.text
             and self._turn_is_active(turn, cancel_event)
         ):
@@ -1212,9 +1092,10 @@ class MikuAssistant:
         if player is None or not turn.speech_turn_id:
             return outcome
 
+        spoken = project_for_speech(self.strip_assistant_prefix(outcome.text))
         ok = player.enqueue(
             turn.speech_turn_id,
-            self.strip_assistant_prefix(outcome.text),
+            spoken,
             cancel_event=turn.cancel,
             extra_cancel=cancel_event,
         )
@@ -1313,6 +1194,36 @@ class MikuAssistant:
             return DispatchOutcome(text="", allow_tts=False, allow_character=False)
         return DispatchOutcome.from_legacy_handler_text(response)
 
+    def begin_voice_input_session(self) -> tuple[bool, str]:
+        engine = self.stt_engine
+        if engine is None:
+            return True, ""
+        starter = getattr(engine, "start_continuous_input", None)
+        if not callable(starter):
+            return True, ""
+        try:
+            return starter()
+        except Exception as exc:
+            self.logger.error(
+                "连续采集启动失败 err=%s", exception_log_label(exc)
+            )
+            return False, "连续采集启动失败"
+
+    def end_voice_input_session(self) -> bool:
+        engine = self.stt_engine
+        if engine is None:
+            return True
+        stopper = getattr(engine, "stop_continuous_input", None)
+        if not callable(stopper):
+            return True
+        try:
+            return stopper() is True
+        except Exception as exc:
+            self.logger.error(
+                "连续采集停止失败 err=%s", exception_log_label(exc)
+            )
+            return False
+
     def recognize_voice_input(
         self,
         continuous: bool = False,
@@ -1343,7 +1254,9 @@ class MikuAssistant:
                     kwargs["phrase_time_limit"] = phrase_time_limit
                 result = recognize(**kwargs)
             except Exception as exc:
-                self.logger.error("语音识别失败: %s", exc)
+                self.logger.error(
+                    "语音识别失败 err=%s", exception_log_label(exc)
+                )
                 return RecognitionResult.failure(
                     RecognitionStatus.INTERNAL_ERROR, str(exc)
                 )
@@ -1355,7 +1268,9 @@ class MikuAssistant:
         try:
             text = self.stt_engine.listen(continuous=continuous)
         except Exception as exc:
-            self.logger.error("语音识别失败: %s", exc)
+            self.logger.error(
+                "语音识别失败 err=%s", exception_log_label(exc)
+            )
             return RecognitionResult.failure(
                 RecognitionStatus.INTERNAL_ERROR, str(exc)
             )
@@ -1392,13 +1307,15 @@ class MikuAssistant:
         直接调用 TTS 朗读文本（同步阻塞）。
 
         Args:
-            text: 待朗读内容；会自动去除 ``Miku: `` 前缀。
+            text: 待朗读内容；会自动去除 ``Miku: `` 前缀并做朗读投影。
         """
-        if self.tts_engine:
-            self.tts_engine.speak(self.strip_assistant_prefix(text))
-        else:
+        if not self.tts_engine:
             self.logger.warning("TTS 模块未初始化")
-
+            return
+        spoken = project_for_speech(self.strip_assistant_prefix(text))
+        if not spoken:
+            return
+        self.tts_engine.speak(spoken)
     def interrupt_active_output(self) -> bool:
         """取消当前生成与待播队列，并尽力停止已经开始的音频输出。"""
         interrupted = False
@@ -1422,7 +1339,11 @@ class MikuAssistant:
                 interrupt_tts()
                 interrupted = True
             except Exception as exc:
-                self.logger.error("停止当前语音输出失败: %s", exc, exc_info=True)
+                self.logger.error(
+                    "停止当前语音输出失败 err=%s",
+                    exception_log_label(exc),
+                    exc_info=True,
+                )
         return interrupted
 
     def shutdown(self) -> None:
@@ -1430,8 +1351,8 @@ class MikuAssistant:
         优雅关闭（容错、顺序幂等）。
 
         顺序：memory runtime → TTS ``shutdown`` → 清理器 → 角色 ``close``。
-        某步普通异常会记录后继续后续步骤。memory 关闭超时/失败时保留重试路径：
-        后续 ``shutdown()`` **只重试尚未完成的 memory close**，不重复关闭已回收资源。
+        某步普通异常会记录后继续后续步骤。已完成步骤不重复执行；
+        任一未实际完成的关闭步骤可在后续 ``shutdown()`` 中重试。
 
         成功时记录「助手已关闭」；任一步失败时记录「关闭流程已结束但部分资源释放失败」，
         不以无条件成功日志掩盖失败。不关闭调用方管理的组件。
@@ -1443,8 +1364,16 @@ class MikuAssistant:
         self.logger.info("正在关闭助手...")
         with self._lifecycle_lock:
             self._shutting_down = True
+            self._voice_load_cancel.set()
         # 先释放 lifecycle，再唤醒 loader 等待者（不得在持 lifecycle 时等 loader）
         self._wake_voice_loaders()
+        from src.core.voice_foreground import (
+            join_foreground_loader_bounded,
+            notify_foreground_shutdown,
+        )
+
+        notify_foreground_shutdown(self)
+        join_foreground_loader_bounded(self, 0.3)
         with self._turn_lock:
             if self._active_turn is not None:
                 self._active_turn.cancel.set()
@@ -1456,13 +1385,13 @@ class MikuAssistant:
                 action()
                 return True
             except Exception as exc:
-                detail = f"{component}.{operation}: {exc}"
+                detail = f"{component}.{operation}: {exception_log_label(exc)}"
                 failures.append(detail)
                 self.logger.error(
-                    "关闭步骤失败 component=%s operation=%s error=%s",
+                    "关闭步骤失败 component=%s operation=%s err=%s",
                     component,
                     operation,
-                    exc,
+                    exception_log_label(exc),
                     exc_info=True,
                 )
                 return False
@@ -1485,8 +1414,13 @@ class MikuAssistant:
 
             return _run_step("memory_runtime", "close", _do_close)
 
-        # 重试路径：仅补完 memory
+        # 重试路径：非 memory 已全部完成时，仅补完 memory
         if self._non_memory_shutdown_done:
+            _run_step(
+                "voice_owner",
+                "retire",
+                lambda: shutdown_retire_owner_in_lane(self),
+            )
             memory_ok = _close_memory()
             if memory_ok:
                 self._shutdown_flow_done = True
@@ -1500,6 +1434,37 @@ class MikuAssistant:
 
         memory_ok = _close_memory()
 
+        if not getattr(self, "_llm_warmup_shutdown_done", False):
+            owner = getattr(self, "_llm_warmup_owner", None)
+            if owner is None:
+                self._llm_warmup_shutdown_done = True
+            elif callable(getattr(type(owner), "close_warmup", None)):
+
+                def _close_llm_warmup() -> None:
+                    if owner.close_warmup(timeout=2.0) is not True:
+                        raise RuntimeError("llm_warmup_owner.close_warmup incomplete")
+                    self._llm_warmup_shutdown_done = True
+
+                _run_step("llm_warmup_owner", "close_warmup", _close_llm_warmup)
+            else:
+
+                def _missing_close_contract() -> None:
+                    raise RuntimeError(
+                        "llm_warmup_owner present but type lacks close_warmup"
+                    )
+
+                _run_step(
+                    "llm_warmup_owner",
+                    "close_warmup",
+                    _missing_close_contract,
+                )
+
+        _run_step(
+            "voice_owner",
+            "retire",
+            lambda: shutdown_retire_owner_in_lane(self),
+        )
+
         # 仅释放本程序 keep_alive 驻留；不停止用户的 Ollama 服务
         release_owned_ollama_model(
             self.llm_client,
@@ -1507,51 +1472,213 @@ class MikuAssistant:
             log=self.logger,
         )
 
-        if self.tts_engine:
-            _run_step("tts_engine", "shutdown", self.tts_engine.shutdown)
+        # F6/F14：speech → TTS → TempFileManager；speech 未完成则不得关闭其依赖
+        if not self._speech_shutdown_done:
+            if self._speech_player is not None:
+                player = self._speech_player
+                player.stop_accepting()
+                if player.shutdown(timeout=2.0):
+                    self._speech_player = None
+                    self._speech_shutdown_done = True
+                else:
+                    failures.append(
+                        "speech_player.shutdown: 有界等待超时（不声称底层播放已停止）"
+                    )
+            else:
+                self._speech_shutdown_done = True
 
-        if self._speech_player is not None:
-            player = self._speech_player
-            self._speech_player = None
-            player.stop_accepting()
-            if not player.shutdown(timeout=2.0):
+        # speech 未完成：本轮跳过 STT/TTS/Temp；memory/cleaner/character 可继续
+        if self._speech_shutdown_done and not self._stt_shutdown_done:
+            if self.stt_engine:
+
+                def _stt_shutdown_and_verify() -> None:
+                    engine = self.stt_engine
+                    shutdown = getattr(engine, "shutdown", None)
+                    if not callable(shutdown):
+                        return
+                    if shutdown() is not True:
+                        raise RuntimeError("stt_engine.shutdown incomplete")
+                    from src.core.voice_activation import stt_shutdown_reports_complete
+
+                    if not stt_shutdown_reports_complete(engine):
+                        raise RuntimeError("stt_engine shutdown status incomplete")
+
+                if _run_step("stt_engine", "shutdown", _stt_shutdown_and_verify):
+                    self._stt_shutdown_done = True
+            else:
+                self._stt_shutdown_done = True
+
+        if (
+            self._speech_shutdown_done
+            and self._stt_shutdown_done
+            and not self._tts_shutdown_done
+        ):
+            if self.tts_engine:
+
+                def _tts_shutdown_and_verify() -> None:
+                    engine = self.tts_engine
+                    engine.shutdown()
+                    if engine_declares_aggregate_shutdown_status(engine):
+                        getter = getattr(engine, "get_shutdown_status")
+                        if not callable(getter):
+                            raise RuntimeError(
+                                "tts_shutdown: get_shutdown_status not callable"
+                            )
+                        verify_aggregate_shutdown_status(getter())
+                        return
+                    if engine_declares_local_cosyvoice_shutdown_status(engine):
+                        reader = getattr(engine, "local_cosyvoice_shutdown_status")
+                        if not callable(reader):
+                            raise RuntimeError(
+                                "local_cosyvoice_shutdown: status not callable"
+                            )
+                        cosy_status = reader()
+                        if cosy_status is None:
+                            raise RuntimeError(
+                                "local_cosyvoice_shutdown: status missing (None)"
+                            )
+                        if getattr(cosy_status, "complete", None) is not True:
+                            raise RuntimeError("local_cosyvoice_shutdown: incomplete")
+                        return
+                    engine_type = getattr(engine, "engine_type", None)
+                    if engine_type == "cosyvoice":
+                        raise RuntimeError(
+                            "local_cosyvoice_shutdown: status missing (noncallable)"
+                        )
+
+                if _run_step("tts_engine", "shutdown", _tts_shutdown_and_verify):
+                    self._tts_shutdown_done = True
+            else:
+                self._tts_shutdown_done = True
+
+        if (
+            self._speech_shutdown_done
+            and self._stt_shutdown_done
+            and self._tts_shutdown_done
+            and not self._temp_shutdown_done
+        ):
+            with self._voice_loader_lock:
+                voice_loading = self._voice_loading
+            with self._lifecycle_lock:
+                voice_pending = self._voice_owner_slot is not None
+            from src.core.voice_foreground import foreground_voice_load_blocks_shutdown
+
+            fg_loading = foreground_voice_load_blocks_shutdown(self)
+            if voice_loading or voice_pending or fg_loading:
                 failures.append(
-                    "speech_player.shutdown: 有界等待超时（不声称底层播放已停止）"
-                )
-
-        if self.file_cleaner:
-            stop_ok = _run_step(
-                "file_cleaner",
-                "stop_auto_cleanup",
-                self.file_cleaner.stop_auto_cleanup,
-            )
-            if stop_ok:
-                _run_step(
-                    "file_cleaner",
-                    "cleanup_now",
-                    self.file_cleaner.cleanup_now,
+                    "temp_file_manager.shutdown: voice stack loader still in flight"
                 )
             else:
-                self.logger.warning(
-                    "file_cleaner.stop_auto_cleanup 失败，跳过 cleanup_now 以免与仍可能运行的清理任务重叠"
+
+                def _retire_policy_rvc_runs() -> None:
+                    if not (
+                        self.safety_policy.retire_rvc_runs(timeout=2.0) is True
+                        and self.safety_policy.rvc_runs_quiescent() is True
+                    ):
+                        raise RuntimeError(
+                            "safety_policy: 单次 RVC run 未静止，保留 TempFileManager 供重试"
+                        )
+
+                policy_retire_ok = _run_step(
+                    "safety_policy", "retire_rvc_runs", _retire_policy_rvc_runs
                 )
+                if policy_retire_ok and self._temp_file_manager is not None:
+                    mgr = self._temp_file_manager
 
-        if self.character_interface:
-            _run_step("character_interface", "close", self.character_interface.close)
+                    def _shutdown_temp() -> None:
+                        status = mgr.shutdown(timeout=2.0)
+                        if not getattr(status, "complete", False):
+                            raise RuntimeError(
+                                "temp_file_manager shutdown incomplete "
+                                f"owned={getattr(status, 'owned', '?')} "
+                                f"pending={getattr(status, 'pending', '?')} "
+                                f"inflight={getattr(status, 'inflight', '?')} "
+                                f"worker_alive={getattr(status, 'worker_alive', '?')} "
+                                f"active_io_leases={getattr(status, 'active_io_leases', '?')}"
+                            )
 
-        self._non_memory_shutdown_done = True
-        if memory_ok:
+                    if _run_step("temp_file_manager", "shutdown", _shutdown_temp):
+                        self._temp_shutdown_done = True
+                elif policy_retire_ok:
+                    self._temp_shutdown_done = True
+
+        if not self._file_cleaner_shutdown_done:
+            if self.file_cleaner:
+                stop_ok = _run_step(
+                    "file_cleaner",
+                    "stop_auto_cleanup",
+                    self.file_cleaner.stop_auto_cleanup,
+                )
+                if stop_ok:
+                    _run_step(
+                        "file_cleaner",
+                        "cleanup_now",
+                        self.file_cleaner.cleanup_now,
+                    )
+                    self._file_cleaner_shutdown_done = True
+                else:
+                    self.logger.warning(
+                        "file_cleaner.stop_auto_cleanup 失败，跳过 cleanup_now 以免与仍可能运行的清理任务重叠"
+                    )
+            else:
+                self._file_cleaner_shutdown_done = True
+
+        if not self._character_shutdown_done:
+            if self.character_interface:
+                if _run_step(
+                    "character_interface", "close", self.character_interface.close
+                ):
+                    self._character_shutdown_done = True
+            else:
+                self._character_shutdown_done = True
+
+        if not getattr(self, "_model_memory_guard_shutdown_done", False):
+            guard = getattr(self, "_model_memory_admission", None)
+            if guard is None:
+                self._model_memory_guard_shutdown_done = True
+            else:
+
+                def _close_model_memory_guard() -> None:
+                    if guard.close(timeout=2.0) is not True:
+                        raise RuntimeError(
+                            "model_memory_admission close incomplete (not quiet)"
+                        )
+
+                if _run_step(
+                    "model_memory_admission",
+                    "close",
+                    _close_model_memory_guard,
+                ):
+                    self._model_memory_guard_shutdown_done = True
+
+        non_memory_ok = (
+            self._speech_shutdown_done
+            and self._stt_shutdown_done
+            and self._tts_shutdown_done
+            and self._temp_shutdown_done
+            and self._file_cleaner_shutdown_done
+            and self._character_shutdown_done
+            and getattr(self, "_model_memory_guard_shutdown_done", True)
+            and getattr(self, "_llm_warmup_shutdown_done", True)
+        )
+        if non_memory_ok:
+            self._non_memory_shutdown_done = True
+        if non_memory_ok and memory_ok:
             self._shutdown_flow_done = True
 
         if failures:
             self.logger.error(
-                "助手关闭流程已结束，但部分资源释放失败（共 %d 项）: %s",
+                "助手关闭流程未完成，部分资源释放失败（共 %d 项，可再次 shutdown 重试）: %s",
                 len(failures),
                 "; ".join(failures),
             )
-        elif memory_ok:
+        elif memory_ok and non_memory_ok:
             self.logger.info("助手已关闭")
-        else:
+        elif non_memory_ok:
             self.logger.error(
                 "助手非 memory 资源已回收，但 memory 关闭未完成（可再次 shutdown 重试）"
+            )
+        else:
+            self.logger.error(
+                "助手关闭未完成（incomplete，可再次 shutdown 重试）"
             )

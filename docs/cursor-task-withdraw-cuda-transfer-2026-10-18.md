@@ -1,0 +1,9 @@
+# Remove unproven CUDA non-blocking follow-up only
+
+2026-10-18 Codex decision after real measurements. Read AGENTS/collaboration-review; preserve all unrelated dirty edits. User requires resource safety and measured optimization, so do NOT retain complexity without benefit.
+
+Actual e127287e961f two-model diagnostic60: Cosy56.672s, AutoModel42.157s, cleanup incomplete(reader alive); peakRSS3820MiB/minfreeRAM30198MiB/minfreeGPU3198MiB. Non-blocking has not demonstrated benefit vs CPU staging-only 69fb748168cd Cosy30.328/construct21.336s. Different startup overhead prevents rigorous speed-regression attribution, but no reason to keep adapter. Default30 also failed 2c218c419c48. No actual synth was made. Root confirmed active adapter in stack. Revert ONLY your e1227107+d6deacf4 nonblocking slice (do not git checkout/reset and never revert CPU staging or fixture fixes).
+
+Remove src/voice/cosyvoice/model_loading.py and its new test module tests/test_cosyvoice_cuda_nonblocking_model_load.py (both solely authored by your slice; verify before deleting). Restore runtime worker _import_cosyvoice_automodel_class -> AutoModel only, _construct_automodel two args with existing cpu_checkpoint_staging_scope only. Restore updated CPU/B import fakes/signatures accordingly, preserving all earlier init/alias/EOF/explicit-progress-stream fixes. Remove just nonblocking test entry from tmp gate. Keep docs historical entries but append measured withdrawal, no performance claims. Do not remove root tmp probes or task/review documents. No vendor/default/timeout/voice/memory changes.
+
+Run original six-module120s gate once (239 tests expected), compile/diff. Do not real test/actual models/main/devices or data/memory, commit/push. Deliver STOP; Codex closes rollback before next lifecycle fix. Windows launcher child-tree containment will be separate task, do not implement it now.

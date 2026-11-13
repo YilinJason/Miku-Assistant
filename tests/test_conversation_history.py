@@ -166,13 +166,16 @@ class ConversationHistoryUnitTests(unittest.TestCase):
     """generate 路径：fake HTTP，验证窗口、提交规则、流式聚合分支。"""
 
     def _client(self, **kwargs: Any) -> OllamaClient:
-        return OllamaClient(base_url="http://fake-ollama", model="test", **kwargs)
+        return OllamaClient(base_url="http://127.0.0.1:9", model="test", **kwargs)
 
     def test_first_and_multi_turn_payload_order_non_stream(self) -> None:
         client = self._client()
         captured: List[Any] = []
 
-        def fake_post(url: str, json: Any = None, timeout: Any = None) -> FakeResponse:
+        def fake_post(
+            url: str, json: Any = None, timeout: Any = None, **kwargs: Any
+        ) -> FakeResponse:
+            self.assertIs(kwargs.get("allow_redirects"), False)
             captured.append(json)
             n = len(captured)
             return _non_stream_ok(f"reply{n}")
@@ -203,7 +206,10 @@ class ConversationHistoryUnitTests(unittest.TestCase):
             client._history.commit_turn(f"u{i}", f"a{i}")
         captured: List[Any] = []
 
-        def fake_post(url: str, json: Any = None, timeout: Any = None) -> FakeResponse:
+        def fake_post(
+            url: str, json: Any = None, timeout: Any = None, **kwargs: Any
+        ) -> FakeResponse:
+            self.assertIs(kwargs.get("allow_redirects"), False)
             captured.append(json)
             return _non_stream_ok("ok")
 

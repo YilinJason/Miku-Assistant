@@ -26,7 +26,7 @@ class _Cfg:
     def __init__(self, data: Optional[Dict[str, Any]] = None):
         self.data = data or {
             "ollama": {
-                "base_url": "http://x",
+                "base_url": "http://127.0.0.1:9",
                 "model": "m",
                 "timeout": 1,
                 "keep_alive": "30m",
@@ -248,7 +248,7 @@ class ResourceCoordTests(unittest.TestCase):
         self.assertFalse(settings.ollama_unload_on_exit)
 
     def test_release_owned_model_fake_http(self) -> None:
-        client = OllamaClient(base_url="http://fake-ollama", model="m", timeout=1)
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="m", timeout=1)
         client._mark_model_touched()
         posted: List[Dict[str, Any]] = []
 
@@ -256,7 +256,13 @@ class ResourceCoordTests(unittest.TestCase):
             def raise_for_status(self) -> None:
                 return None
 
-        def fake_post(url: str, json: Dict[str, Any] = None, timeout: float = 0):
+        def fake_post(
+            url: str,
+            json: Dict[str, Any] = None,
+            timeout: float = 0,
+            **kwargs: Any,
+        ):
+            self.assertIs(kwargs.get("allow_redirects"), False)
             posted.append({"url": url, "json": json, "timeout": timeout})
             return _Resp()
 

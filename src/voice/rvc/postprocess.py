@@ -43,4 +43,4 @@ def polish_rvc_wav(wav_path: str, rvc_config: Dict[str, Any] | None = None) -> N
         audio = audio * min(1.0, peak_target / peak)
 
     sf.write(wav_path, audio, sr)
-    logger.debug("RVC 后处理完成: %s (hp=%.0fHz)", wav_path, highpass_hz)
+    logger.debug("RVC 后处理完成 hp=%.0fHz", highpass_hz)

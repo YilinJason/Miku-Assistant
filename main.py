@@ -14,15 +14,25 @@
 支持的启动入口为仓库根目录的 ``main.py``（委托 ``src.cli.app.main``）。
 ``python -m src.cli.app`` 当前仅加载模块、**不会**自动调用 ``main()``
 （``src/cli/app.py`` 无 ``__main__`` 入口）；本阶段不新增模块入口。
+
+嵌入调用方若需与 CLI 相同的 BLAS/OMP 单线程预算，须在导入 numpy/onnxruntime
+之前显式调用 ``src.core.numeric_bootstrap.apply_main_numeric_thread_budget()``。
 """
 import sys
 from pathlib import Path
 
-# 确保从任意工作目录启动时都能 import src 包
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from src.cli.app import main
+
+def main() -> None:
+    from src.core.numeric_bootstrap import apply_main_numeric_thread_budget
+
+    apply_main_numeric_thread_budget()
+    from src.cli.app import main as cli_main
+
+    cli_main()
+
 
 if __name__ == "__main__":
     main()

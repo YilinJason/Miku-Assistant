@@ -1,0 +1,11 @@
+# First supervised setup execution — controlled refusal
+
+`tmp/asr_gate_prepare_nov5k.json`: child exit1 in2.031s, NativeJob cleanup_complete=True, no abort/memory pressure. Memory48457/43948 ->48444/43943 MiB. `tmp/paraformer_asr_setup_e43c518f8109.json`: PermissionError `禁止覆盖 env`. No .venv-asr/model installation occurred.
+
+Root cause: preparation uses safe_subprocess_run with cwd/env. Actual `sanitize_run_kwargs` deliberately forbids BOTH. This was missed by fake tests which mocked that interface. DO NOT relax shared SafetyPolicy or RVC sanitizers, and do not bypass them via raw subprocess/private policy runners.
+
+Correct all preparation command sites (_run_subprocess, verify_asr_env_identity, capture_pip_inventory) using the already allowed `safe_subprocess_popen` contract. Keep fixed cwd/minimal env and bounded waiting/capture. Commands have explicit venv/pip/check/freeze purpose; no arbitrary shell or user command. Prefer a small reusable preparation-local runner, not copied RVC coordinator or a new general framework.
+
+Each command must have actual tree ownership: can reuse spawn_owned_local_tts_worker with a small fixed setup child trampoline that joins its supplied Job before running whitelisted venv/pip/env-check/freeze code, then call it through safe_subprocess_popen. Do not call that NativeJob helper on plain pip without a join entry. Whole reviewed setup is also inside Codex outer NativeJob; keep standalone explicit --execute cleanup sound. Fixed child args/modes only, no arbitrary -c code execution inputs. On timeout terminate the owned command Job and confirm quiescence; incomplete cleanup aborts setup (no retry while owner exists). File-backed bounded capture for metadata/freeze is sufficient; do not accumulate unlimited pip output or orphan capturer threads. KeyboardInterrupt/SystemExit propagate after cleanup. Root supergate monitors logs and host memory throughout.
+
+Add an offline integration test using actual SafetyPolicy sanitation with injected fake Popen/owned-job backend, proving cwd/env are accepted on the chosen contract, rather than mocking away the policy. Test timeout cleanup, stdout capture, failure propagation; no real subprocess/install/model/device. You ARE authorized to write/update code and tests. DO NOT EXECUTE tests/setup/download/models/devices/default changes. STOP for Codex review.

@@ -22,6 +22,7 @@ wheels/
 
 # 虚拟环境与本地工具
 .venv-rvc/
+.venv-asr/
 venv/
 env/
 ENV/

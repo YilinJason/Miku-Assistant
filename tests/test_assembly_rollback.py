@@ -28,7 +28,7 @@ class MemoryConfig:
 def _base_config(*, character: bool = False) -> MemoryConfig:
     return MemoryConfig(
         {
-            "ollama": {"base_url": "http://x", "model": "m", "timeout": 1},
+            "ollama": {"base_url": "http://127.0.0.1:9", "model": "m", "timeout": 1},
             "voice": {
                 "tts": {
                     "engine": "edge-tts",
@@ -57,6 +57,19 @@ def _base_config(*, character: bool = False) -> MemoryConfig:
             },
         }
     )
+
+
+class TrackingSTT:
+    def __init__(self, **kwargs: Any):
+        self.kwargs = kwargs
+        self.shutdown_calls = 0
+        self.shutdown_error: Optional[BaseException] = None
+
+    def shutdown(self) -> bool:
+        self.shutdown_calls += 1
+        if self.shutdown_error:
+            raise self.shutdown_error
+        return True
 
 
 class TrackingTTS:
@@ -385,11 +398,14 @@ class AssemblyRollbackTests(unittest.TestCase):
         self.assertEqual(order, ["cleaner_stop", "char", "tts"])
         self.assertEqual(cleaner.stop_calls, 1)
         self.assertEqual(cleaner.cleanup_calls, 0)
-        joined = "\n".join(logs.output)
-        self.assertIn("file_cleaner.stop_auto_cleanup", joined)
-        self.assertIn("character_interface.close", joined)
-        self.assertIn("cleaner rollback fail", joined)
-        self.assertIn("char rollback fail", joined)
+        # 仅检查 message 正文（assertLogs 的 traceback 仍可含异常链，属控制台行为）
+        messages = [record.getMessage() for record in logs.records]
+        joined_msgs = "\n".join(messages)
+        self.assertIn("file_cleaner.stop_auto_cleanup", joined_msgs)
+        self.assertIn("character_interface.close", joined_msgs)
+        self.assertIn("err=RuntimeError", joined_msgs)
+        self.assertTrue(all("cleaner rollback fail" not in m for m in messages))
+        self.assertTrue(all("char rollback fail" not in m for m in messages))
 
     def test_start_fail_immediate_stop_fail_then_router_fail_two_phase_stop(self) -> None:
         """阶段一立即 stop 失败后，致命回滚阶段再尝试 stop 一次。"""
@@ -426,6 +442,110 @@ class AssemblyRollbackTests(unittest.TestCase):
         self.assertIn("启动失败", joined)
         self.assertIn("装配回滚失败", joined)
         self.assertIn("file_cleaner.stop_auto_cleanup", joined)
+
+
+    def test_router_failure_reclaims_stt_before_tts(self) -> None:
+        order: List[str] = []
+        stt_holder: List[TrackingSTT] = []
+
+        def tts_cls(**kwargs: Any) -> TrackingTTS:
+            obj = TrackingTTS(**kwargs)
+
+            def _shutdown() -> bool:
+                order.append("tts")
+                obj.shutdown_calls += 1
+                return True
+
+            obj.shutdown = _shutdown  # type: ignore[method-assign]
+            return obj
+
+        def stt_cls(**kwargs: Any) -> TrackingSTT:
+            obj = TrackingSTT(**kwargs)
+            stt_holder.append(obj)
+
+            def _shutdown() -> bool:
+                order.append("stt")
+                obj.shutdown_calls += 1
+                return True
+
+            obj.shutdown = _shutdown  # type: ignore[method-assign]
+            return obj
+
+        def router_builder(**kwargs: Any) -> IntentRouter:
+            raise RuntimeError("router after voice stack")
+
+        with self.assertRaisesRegex(RuntimeError, "router after voice stack"):
+            assemble_default(
+                **self._common_kwargs(
+                    tts_engine_cls=tts_cls,
+                    stt_engine_cls=stt_cls,
+                    router_builder=router_builder,
+                )
+            )
+        self.assertEqual(order, ["stt", "tts"])
+        self.assertEqual(stt_holder[0].shutdown_calls, 1)
+
+    def test_legacy_stt_without_shutdown_skips_stt_rollback(self) -> None:
+        class LegacySTT:
+            def __init__(self, **kwargs: Any):
+                self.kwargs = kwargs
+
+        tts_holder: List[TrackingTTS] = []
+
+        def tts_cls(**kwargs: Any) -> TrackingTTS:
+            obj = TrackingTTS(**kwargs)
+            tts_holder.append(obj)
+            return obj
+
+        def router_builder(**kwargs: Any) -> IntentRouter:
+            raise RuntimeError("router after legacy stt")
+
+        with self.assertRaisesRegex(RuntimeError, "router after legacy stt"):
+            assemble_default(
+                **self._common_kwargs(
+                    tts_engine_cls=tts_cls,
+                    stt_engine_cls=LegacySTT,
+                    router_builder=router_builder,
+                )
+            )
+        self.assertEqual(tts_holder[0].shutdown_calls, 1)
+
+    def test_resource_owning_stt_rollback_logs_incomplete_shutdown(self) -> None:
+        class IncompleteParaformerSTT:
+            engine_type = "paraformer"
+
+            def __init__(self, **kwargs: Any):
+                self.kwargs = kwargs
+                self.shutdown_calls = 0
+
+            def shutdown(self) -> bool:
+                self.shutdown_calls += 1
+                return False
+
+            def is_shutdown_complete(self) -> bool:
+                return False
+
+        stt_holder: List[IncompleteParaformerSTT] = []
+
+        def stt_cls(**kwargs: Any) -> IncompleteParaformerSTT:
+            obj = IncompleteParaformerSTT(**kwargs)
+            stt_holder.append(obj)
+            return obj
+
+        def router_builder(**kwargs: Any) -> IntentRouter:
+            raise RuntimeError("router after paraformer stt")
+
+        with self.assertLogs("src.core.assembly", level="ERROR") as logs:
+            with self.assertRaisesRegex(RuntimeError, "router after paraformer stt"):
+                assemble_default(
+                    **self._common_kwargs(
+                        stt_engine_cls=stt_cls,
+                        router_builder=router_builder,
+                    )
+                )
+        self.assertEqual(stt_holder[0].shutdown_calls, 1)
+        joined = "\n".join(record.getMessage() for record in logs.records)
+        self.assertIn("stt_rollback_incomplete", joined)
 
 
 if __name__ == "__main__":

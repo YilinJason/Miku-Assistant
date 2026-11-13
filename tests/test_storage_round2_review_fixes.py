@@ -489,7 +489,7 @@ class Finding6FiniteTimeoutTests(unittest.TestCase):
 
 class Finding7UnloadSemanticsTests(unittest.TestCase):
     def test_never_touched_skips_http(self) -> None:
-        client = OllamaClient(base_url="http://fake", model="m", timeout=1)
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="m", timeout=1)
         posted: List[Any] = []
 
         class _Resp:
@@ -501,7 +501,7 @@ class Finding7UnloadSemanticsTests(unittest.TestCase):
         self.assertEqual(posted, [])
 
     def test_touched_sends_keep_alive_zero(self) -> None:
-        client = OllamaClient(base_url="http://fake", model="m", timeout=1)
+        client = OllamaClient(base_url="http://127.0.0.1:9", model="m", timeout=1)
         client._mark_model_touched()
         posted: List[Any] = []
 
@@ -509,7 +509,8 @@ class Finding7UnloadSemanticsTests(unittest.TestCase):
             def raise_for_status(self) -> None:
                 return None
 
-        def fake_post(url, json=None, timeout=0):
+        def fake_post(url, json=None, timeout=0, **kwargs):
+            self.assertIs(kwargs.get("allow_redirects"), False)
             posted.append(json)
             return _Resp()
 

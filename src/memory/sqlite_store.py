@@ -29,6 +29,13 @@ from src.memory.models import (
     default_id_factory,
     normalize_dedupe_key,
 )
+from src.memory.sqlite_security import (
+    DEFAULT_BUSY_TIMEOUT_SEC,
+    TrustedDbParent,
+    connect_memory_db,
+    revalidate_db_location,
+    validate_busy_timeout_sec,
+)
 
 SCHEMA_VERSION = 1
 
@@ -72,14 +79,18 @@ class SqliteMemoryStore:
         clock: Optional[Clock] = None,
         id_factory: Optional[IdFactory] = None,
         logger: Optional[logging.Logger] = None,
+        busy_timeout_sec: float = DEFAULT_BUSY_TIMEOUT_SEC,
     ) -> None:
         self._path = Path(db_path)
         self._clock = clock or default_clock
         self._id_factory = id_factory or default_id_factory
         self._logger = logger or logging.getLogger(__name__)
+        self._busy_timeout_sec = validate_busy_timeout_sec(busy_timeout_sec)
         self._lock = threading.RLock()
         self._closed = False
         self._conn: Optional[sqlite3.Connection] = None
+        self._trusted_parent: Optional[TrustedDbParent] = None
+        self._trusted_db_identity: Optional[tuple[int, int]] = None
         self._open()
 
     @property
@@ -359,6 +370,9 @@ class SqliteMemoryStore:
                             truncated = True
                     elif remaining_budget <= 0:
                         truncated = True
+            except MemoryStoreUnavailableError as exc:
+                self._logger.error("memory prune rejected err=%s", type(exc).__name__)
+                raise
             except sqlite3.Error as exc:
                 self._logger.error("memory prune failed err=%s", type(exc).__name__)
                 raise MemoryStoreUnavailableError("failed to prune memories") from exc
@@ -374,9 +388,14 @@ class SqliteMemoryStore:
     def vacuum_offline(self) -> None:
         """显式离线 VACUUM；可能长时间锁库，禁止在热路径调用。"""
         with self._lock:
-            conn = self._require_conn()
+            conn = self._require_conn_for_write()
             try:
+                self._revalidate_for_write()
                 conn.execute("VACUUM")
+                self._revalidate_for_write()
+            except MemoryStoreUnavailableError as exc:
+                self._logger.error("memory vacuum rejected err=%s", type(exc).__name__)
+                raise
             except sqlite3.Error as exc:
                 self._logger.error("memory vacuum failed err=%s", type(exc).__name__)
                 raise MemoryStoreUnavailableError("failed to vacuum memory db") from exc
@@ -499,17 +518,16 @@ class SqliteMemoryStore:
     def _open(self) -> None:
         conn: Optional[sqlite3.Connection] = None
         try:
-            parent = self._path.parent
-            if parent and str(parent) not in ("", "."):
-                parent.mkdir(parents=True, exist_ok=True)
-            # 默认 isolation_level=""：DML 开启真实事务；非 autocommit
-            conn = sqlite3.connect(
-                str(self._path),
+            opened = connect_memory_db(
+                self._path,
+                readonly=False,
+                busy_timeout_sec=self._busy_timeout_sec,
                 check_same_thread=False,
             )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA journal_mode = DELETE")
+            conn = opened.conn
+            self._trusted_parent = opened.parent
+            self._trusted_db_identity = opened.db_identity
+            self._path = opened.path
             found = int(conn.execute("PRAGMA user_version").fetchone()[0])
             if found > SCHEMA_VERSION:
                 conn.close()
@@ -520,17 +538,26 @@ class SqliteMemoryStore:
                     supported_version=SCHEMA_VERSION,
                 )
             self._initialize_schema(conn, found_version=found)
+            self._trusted_db_identity = revalidate_db_location(
+                self._path,
+                self._trusted_parent,
+                expected_db_identity=self._trusted_db_identity,
+            )
             self._conn = conn
             conn = None
         except MemorySchemaIncompatibleError:
             raise
-        except MemoryStoreUnavailableError:
+        except MemoryValidationError as exc:
+            self._logger.error("memory open rejected err=%s", type(exc).__name__)
+            raise MemoryStoreUnavailableError("failed to open memory database") from exc
+        except MemoryStoreUnavailableError as exc:
+            cause = exc.__cause__
+            err_name = type(cause).__name__ if cause is not None else type(exc).__name__
+            self._logger.error("memory open failed err=%s", err_name)
             raise
         except (sqlite3.Error, OSError) as exc:
             self._logger.error("memory open failed err=%s", type(exc).__name__)
-            raise MemoryStoreUnavailableError(
-                f"failed to open memory database: {self._path}"
-            ) from exc
+            raise MemoryStoreUnavailableError("failed to open memory database") from exc
         finally:
             if conn is not None:
                 try:
@@ -556,19 +583,53 @@ class SqliteMemoryStore:
 
     @contextmanager
     def _transaction(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+        """
+        BEGIN 成功后，yield / 事后复验 / COMMIT 均在同一 guard 内；
+        任意 BaseException（含 COMMIT 失败、KI/SystemExit）先尽力 rollback。
+        """
+        self._revalidate_for_write()
         conn.execute("BEGIN IMMEDIATE")
+        begun = True
         try:
             yield conn
-        except BaseException:
-            conn.rollback()
-            raise
-        else:
+            self._revalidate_for_write()
             conn.commit()
+            begun = False
+        except BaseException:
+            if begun:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise
+
+    def _require_trusted_parent(self) -> TrustedDbParent:
+        if self._trusted_parent is None:
+            raise MemoryStoreUnavailableError("memory store parent is unbound")
+        return self._trusted_parent
+
+    def _require_trusted_db_identity(self) -> tuple[int, int]:
+        if self._trusted_db_identity is None:
+            raise MemoryStoreUnavailableError("memory store db identity is unbound")
+        return self._trusted_db_identity
+
+    def _revalidate_for_write(self) -> None:
+        identity = revalidate_db_location(
+            self._path,
+            self._require_trusted_parent(),
+            expected_db_identity=self._require_trusted_db_identity(),
+        )
+        self._trusted_db_identity = identity
 
     def _require_conn(self) -> sqlite3.Connection:
         if self._closed or self._conn is None:
             raise MemoryStoreUnavailableError("memory store is closed")
         return self._conn
+
+    def _require_conn_for_write(self) -> sqlite3.Connection:
+        conn = self._require_conn()
+        self._revalidate_for_write()
+        return conn
 
     def _now(self) -> datetime:
         value = self._clock()

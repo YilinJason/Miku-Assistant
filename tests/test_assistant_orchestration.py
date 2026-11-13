@@ -2,15 +2,25 @@
 from __future__ import annotations
 
 import logging
+import threading
 import unittest
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, call, patch
 
 from src.core.assembly import assemble_default
 from src.core.assistant import MikuAssistant
+from src.core.dispatch_outcome import DispatchOutcome
+from src.core.owned_thread import OwnedThreadTask
 from src.core.router import IntentRouter
+from src.core.speech_queue import PlaybackStatus, TurnSpeechPlayer
 from src.llm.ollama_client import OllamaClient
+from src.voice.cosyvoice.client import CosyVoiceShutdownStatus
 from src.voice.stt import STTEngine
+from src.core.shutdown_status import (
+    TtsShutdownStatus,
+    engine_declares_aggregate_shutdown_status,
+    engine_declares_shutdown_api,
+)
 from src.voice.tts.engine import TTSEngine
 
 
@@ -99,31 +109,37 @@ class FakeCleaner:
         self.cleanup_calls += 1
 
 
-def _immediate_thread_factory(*, fail_start: bool = False):
-    """可控线程替身：构造成功；start 同步执行 target，或按需抛错。"""
+def _wait_player_turn(
+    assistant: MikuAssistant, *, timeout: float = 3.0
+) -> PlaybackStatus:
+    player = assistant._speech_player  # noqa: SLF001
+    turn = assistant._active_turn  # noqa: SLF001
+    if player is None or turn is None or not turn.speech_turn_id:
+        raise AssertionError("expected active speech turn")
+    return player.wait_for_turn(turn.speech_turn_id, timeout=timeout)
 
-    created: List[Any] = []
 
-    def factory(*args: Any, **kwargs: Any) -> MagicMock:
-        inst = MagicMock(name="ImmediateThread")
-        target = kwargs.get("target")
-        targs = kwargs.get("args") or ()
-        tkwargs = kwargs.get("kwargs") or {}
+def _require_player_quiet(player: TurnSpeechPlayer, *, timeout: float = 3.0) -> None:
+    if not player.shutdown(timeout=timeout):
+        raise AssertionError("TurnSpeechPlayer did not shut down quietly")
+    if not player._owner.snapshot().quiet:  # noqa: SLF001
+        raise AssertionError("OwnedThreadTask not quiet after player shutdown")
 
-        def start() -> None:
-            if fail_start:
-                raise RuntimeError("start failed")
-            if target is not None:
-                target(*targs, **tkwargs)
 
-        inst.start = MagicMock(side_effect=start)
-        inst._target = target
-        inst._args = targs
-        created.append(inst)
-        return inst
-
-    factory.created = created  # type: ignore[attr-defined]
-    return factory
+def _shutdown_assistant_with_player(
+    assistant: MikuAssistant,
+    *,
+    release: Optional[threading.Event] = None,
+    player_timeout: float = 3.0,
+) -> None:
+    if release is not None:
+        release.set()
+    player = assistant._speech_player  # noqa: SLF001
+    if player is not None:
+        _require_player_quiet(player, timeout=player_timeout)
+    assistant.shutdown()
+    if not assistant._shutdown_flow_done:  # noqa: SLF001
+        raise AssertionError("assistant shutdown_flow not complete")
 
 
 class InjectionSideEffectGuards(unittest.TestCase):
@@ -189,7 +205,9 @@ class LoggerInjectionTests(unittest.TestCase):
 class ProcessTextInputTests(unittest.TestCase):
     def _make(self, **kwargs) -> MikuAssistant:
         config = kwargs.pop("config", MemoryConfig({"assistant": {"auto_tts": True}}))
-        return MikuAssistant.from_dependencies(config, **kwargs)
+        assistant = MikuAssistant.from_dependencies(config, **kwargs)
+        self.addCleanup(_shutdown_assistant_with_player, assistant)
+        return assistant
 
     def test_dispatch_input_and_return(self) -> None:
         router = FakeRouter("answer")
@@ -203,58 +221,42 @@ class ProcessTextInputTests(unittest.TestCase):
         config = MemoryConfig({"assistant": {"auto_tts": True}})
         assistant = self._make(config=config, router=router, tts_engine=tts)  # type: ignore[arg-type]
 
-        with patch("src.core.assistant.threading.Thread") as thread_cls:
-            thread_cls.side_effect = _immediate_thread_factory()
-            assistant.process_text_input("x", use_tts=False)
-            thread_cls.assert_not_called()
-            self.assertEqual(tts.speak_calls, [])
+        assistant.process_text_input("x", use_tts=False)
+        self.assertEqual(tts.speak_calls, [])
+        self.assertIsNone(assistant._speech_player)  # noqa: SLF001
 
-        factory = _immediate_thread_factory()
-        with patch("src.core.assistant.threading.Thread", side_effect=factory) as thread_cls:
-            config.data["assistant"]["auto_tts"] = False
-            assistant.process_text_input("y", use_tts=True)
-            thread_cls.assert_called_once()
-            self.assertEqual(len(factory.created), 1)
-            factory.created[0].start.assert_called_once()
-            self.assertEqual(tts.speak_calls, ["hello"])
+        config.data["assistant"]["auto_tts"] = False
+        assistant.process_text_input("y", use_tts=True)
+        self.assertEqual(_wait_player_turn(assistant), PlaybackStatus.COMPLETED)
+        self.assertEqual(tts.speak_calls, ["hello"])
 
     def test_use_tts_none_reads_config(self) -> None:
         tts = FakeTTS()
         router = FakeRouter("plain")
         config = MemoryConfig({"assistant": {"auto_tts": False}})
         assistant = self._make(config=config, router=router, tts_engine=tts)  # type: ignore[arg-type]
-        with patch("src.core.assistant.threading.Thread") as thread_cls:
-            assistant.process_text_input("z", use_tts=None)
-            thread_cls.assert_not_called()
+        assistant.process_text_input("z", use_tts=None)
+        self.assertEqual(tts.speak_calls, [])
 
-        factory = _immediate_thread_factory()
-        with patch("src.core.assistant.threading.Thread", side_effect=factory):
-            config.data["assistant"]["auto_tts"] = True
-            assistant.process_text_input("z2", use_tts=None)
-            factory.created[0].start.assert_called_once()
-            self.assertEqual(tts.speak_calls, ["plain"])
+        config.data["assistant"]["auto_tts"] = True
+        assistant.process_text_input("z2", use_tts=None)
+        self.assertEqual(_wait_player_turn(assistant), PlaybackStatus.COMPLETED)
+        self.assertEqual(tts.speak_calls, ["plain"])
 
-    def test_thread_start_failure_falls_back_to_sync_speak(self) -> None:
+    def test_legacy_playback_uses_player_not_per_reply_thread(self) -> None:
         tts = FakeTTS()
-        router = FakeRouter("Miku: sync")
-        logger = MagicMock()
-        assistant = self._make(
-            router=router, tts_engine=tts, logger=logger  # type: ignore[arg-type]
-        )
-        factory = _immediate_thread_factory(fail_start=True)
-        with patch("src.core.assistant.threading.Thread", side_effect=factory):
-            assistant.process_text_input("a", use_tts=True)
-            factory.created[0].start.assert_called_once()
-            self.assertEqual(tts.speak_calls, ["sync"])
-            logger.error.assert_called()
-            self.assertIn("启动音频播放线程失败", logger.error.call_args[0][0])
+        router = FakeRouter("Miku: queued")
+        assistant = self._make(router=router, tts_engine=tts)  # type: ignore[arg-type]
+        assistant.process_text_input("a", use_tts=True)
+        self.assertIsNotNone(assistant._speech_player)  # noqa: SLF001
+        self.assertEqual(_wait_player_turn(assistant), PlaybackStatus.COMPLETED)
+        self.assertEqual(tts.speak_calls, ["queued"])
 
     def test_character_forward(self) -> None:
         router = FakeRouter("char-msg")
         character = FakeCharacter(initialized=True)
         assistant = self._make(router=router, character_interface=character)  # type: ignore[arg-type]
-        with patch("src.core.assistant.threading.Thread"):
-            self.assertEqual(assistant.process_text_input("q", use_tts=False), "char-msg")
+        self.assertEqual(assistant.process_text_input("q", use_tts=False), "char-msg")
         self.assertEqual(character.messages, ["char-msg"])
 
         character2 = FakeCharacter(initialized=False)
@@ -367,6 +369,34 @@ class ShutdownLifecycleTests(unittest.TestCase):
             )
         )
 
+    def test_cosy_incomplete_shutdown_allows_tts_retry_before_tfm(self) -> None:
+        class CosyTTS:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.done = False
+
+            def shutdown(self) -> None:
+                self.calls += 1
+
+            def local_cosyvoice_shutdown_status(self):
+                return CosyVoiceShutdownStatus(
+                    complete=self.done,
+                    worker_alive=not self.done,
+                    reader_alive=False,
+                    writer_alive=False,
+                )
+
+        tts = CosyTTS()
+        logger = MagicMock()
+        assistant = self._assistant(logger=logger, tts_engine=tts)  # type: ignore[arg-type]
+        assistant.shutdown()
+        self.assertEqual(tts.calls, 1)
+        self.assertFalse(assistant._tts_shutdown_done)  # noqa: SLF001
+        tts.done = True
+        assistant.shutdown()
+        self.assertEqual(tts.calls, 2)
+        self.assertTrue(assistant._tts_shutdown_done)  # noqa: SLF001
+
     def test_tts_shutdown_failure_continues(self) -> None:
         order: List[str] = []
         tts = FakeTTS()
@@ -458,7 +488,7 @@ class ShutdownLifecycleTests(unittest.TestCase):
             any("部分资源释放失败" in str(c) for c in logger.error.call_args_list)
         )
 
-    def test_multiple_failures_recorded_no_retry_on_repeat(self) -> None:
+    def test_multiple_failures_recorded_retry_incomplete_only(self) -> None:
         logger = MagicMock()
         tts = FakeTTS()
         cleaner = FakeCleaner()
@@ -484,12 +514,456 @@ class ShutdownLifecycleTests(unittest.TestCase):
         self.assertIn("stop_auto_cleanup", err_text)
         self.assertIn("character_interface", err_text)
         self.assertIn("部分资源释放失败", err_text)
+        self.assertFalse(assistant._shutdown_flow_done)  # noqa: SLF001
 
+        # 未完成项可有界重试；仍失败则再次保持 incomplete
+        assistant.shutdown()
+        self.assertEqual(tts.shutdown.call_count, 2)
+        self.assertEqual(cleaner.stop_auto_cleanup.call_count, 2)
+        self.assertEqual(character.close.call_count, 2)
+        cleaner.cleanup_now.assert_not_called()
+        self.assertFalse(assistant._shutdown_flow_done)  # noqa: SLF001
+
+        # 此后成功：exactly-once 完成后不再重复
+        tts.shutdown = MagicMock()
+        cleaner.stop_auto_cleanup = MagicMock()
+        character.close = MagicMock()
+        assistant.tts_engine.shutdown = tts.shutdown
+        assistant.file_cleaner.stop_auto_cleanup = cleaner.stop_auto_cleanup
+        assistant.character_interface.close = character.close
         assistant.shutdown()
         self.assertEqual(tts.shutdown.call_count, 1)
         self.assertEqual(cleaner.stop_auto_cleanup.call_count, 1)
         self.assertEqual(character.close.call_count, 1)
-        cleaner.cleanup_now.assert_not_called()
+        self.assertTrue(assistant._shutdown_flow_done)  # noqa: SLF001
+        assistant.shutdown()
+        self.assertEqual(tts.shutdown.call_count, 1)
+        self.assertEqual(cleaner.stop_auto_cleanup.call_count, 1)
+        self.assertEqual(character.close.call_count, 1)
+
+
+def _assistant_tts_shutdown_shell() -> TTSEngine:
+    engine = object.__new__(TTSEngine)
+    engine._shutdown_event = threading.Event()  # noqa: SLF001
+    engine._speak_lock = threading.Lock()  # noqa: SLF001
+    engine._player = MagicMock()  # noqa: SLF001
+    engine._cosy_backend = None  # noqa: SLF001
+    engine._cosy_local_shutdown_status = None  # noqa: SLF001
+    engine._owns_temp_files = True  # noqa: SLF001
+    engine._temp_files_shutdown_done = False  # noqa: SLF001
+    engine._temp_files = MagicMock()  # noqa: SLF001
+    engine._temp_files.shutdown = MagicMock(  # noqa: SLF001
+        return_value=MagicMock(complete=True)
+    )
+    engine.logger = logging.getLogger("test.assistant.tts_shutdown")
+    engine._interrupt_event = threading.Event()  # noqa: SLF001
+    engine._interrupt_epoch_lock = threading.Lock()  # noqa: SLF001
+    engine._interrupt_epoch = 0  # noqa: SLF001
+    engine._turn_stream_session = None  # noqa: SLF001
+    engine._turn_stream_session_lock = threading.Lock()  # noqa: SLF001
+    engine._pyttsx3 = None  # noqa: SLF001
+    engine._tts_shutdown_status = None  # noqa: SLF001
+    return engine
+
+
+class TtsShutdownPropagationTests(unittest.TestCase):
+    def _assistant(self, **kwargs) -> MikuAssistant:
+        logger = kwargs.pop("logger", MagicMock(name="logger"))
+        return MikuAssistant.from_dependencies(
+            MemoryConfig(),
+            logger=logger,
+            router=kwargs.pop("router", FakeRouter()),  # type: ignore[arg-type]
+            **kwargs,
+        )
+
+    def test_rvc_incomplete_keeps_tts_and_runs_cleaner(self) -> None:
+        engine = _assistant_tts_shutdown_shell()
+        outcomes = iter([False, True])
+        cleaner = FakeCleaner()
+        order: list[str] = []
+
+        def _stop() -> bool:
+            return next(outcomes)
+
+        with patch("src.voice.rvc.infer.stop_rvc_worker", side_effect=_stop):
+            cleaner.stop_auto_cleanup = MagicMock(
+                side_effect=lambda: order.append("stop")
+            )
+            cleaner.cleanup_now = MagicMock(
+                side_effect=lambda: order.append("cleanup")
+            )
+            assistant = self._assistant(tts_engine=engine, file_cleaner=cleaner)
+            assistant.shutdown()
+            self.assertIs(assistant.tts_engine, engine)
+            self.assertFalse(assistant._tts_shutdown_done)  # noqa: SLF001
+            self.assertEqual(order, ["stop", "cleanup"])
+            assistant.shutdown()
+        self.assertTrue(assistant._tts_shutdown_done)  # noqa: SLF001
+        self.assertTrue(engine.get_shutdown_status().complete)
+
+    def test_voice_loading_blocks_shared_tfm_shutdown(self) -> None:
+        engine = _assistant_tts_shutdown_shell()
+        mgr = MagicMock()
+        mgr.shutdown = MagicMock(return_value=MagicMock(complete=True))
+        with patch("src.voice.rvc.infer.stop_rvc_worker", return_value=True):
+            assistant = self._assistant(tts_engine=engine)
+            assistant._temp_file_manager = mgr  # noqa: SLF001
+            assistant.temp_file_manager = mgr
+            assistant._voice_loading = True  # noqa: SLF001
+            assistant.shutdown()
+        self.assertTrue(assistant._tts_shutdown_done)  # noqa: SLF001
+        self.assertFalse(assistant._temp_shutdown_done)  # noqa: SLF001
+        mgr.shutdown.assert_not_called()
+
+    def test_magicmock_tts_does_not_require_aggregate_status(self) -> None:
+        tts = MagicMock()
+        tts.shutdown = MagicMock()
+        assistant = self._assistant(tts_engine=tts)
+        assistant.shutdown()
+        self.assertFalse(engine_declares_aggregate_shutdown_status(tts))
+        self.assertTrue(assistant._tts_shutdown_done)  # noqa: SLF001
+
+    def test_declared_adapter_incomplete_not_marked_done(self) -> None:
+        class Adapter:
+            engine_type = "edge-tts"
+
+            def shutdown(self) -> None:
+                pass
+
+            def get_shutdown_status(self):
+                return TtsShutdownStatus(
+                    complete=False,
+                    local_tts_complete=False,
+                    persistent_rvc_complete=False,
+                    rvc_subprocess_complete=False,
+                    synthesis_idle=False,
+                    temp_files_complete=False,
+                )
+
+            def local_cosyvoice_shutdown_status(self):
+                return None
+
+        assistant = self._assistant(tts_engine=Adapter())
+        assistant.shutdown()
+        self.assertFalse(assistant._tts_shutdown_done)  # noqa: SLF001
+
+    def test_non_boolean_aggregate_status_rejected(self) -> None:
+        engine = _assistant_tts_shutdown_shell()
+        with patch.object(engine, "shutdown"), patch.object(
+            engine,
+            "get_shutdown_status",
+            return_value=TtsShutdownStatus(  # type: ignore[arg-type]
+                complete=1,  # noqa: SLF001 — intentional malformed probe parity
+                local_tts_complete=True,
+                persistent_rvc_complete=True,
+                rvc_subprocess_complete=True,
+                synthesis_idle=True,
+                temp_files_complete=True,
+            ),
+        ):
+            assistant = self._assistant(tts_engine=engine)
+            assistant.shutdown()
+        self.assertFalse(assistant._tts_shutdown_done)  # noqa: SLF001
+
+
+class ShutdownStatusProtocolTests(unittest.TestCase):
+    def test_class_declared_aggregate_api_detected(self) -> None:
+        class Adapter:
+            def get_shutdown_status(self):
+                return TtsShutdownStatus(
+                    True, True, True, True, True, True
+                )
+
+        self.assertTrue(engine_declares_aggregate_shutdown_status(Adapter()))
+
+    def test_instance_declared_aggregate_api_detected(self) -> None:
+        class Legacy:
+            engine_type = "edge-tts"
+
+            def shutdown(self) -> None:
+                pass
+
+        engine = Legacy()
+        engine.get_shutdown_status = lambda: TtsShutdownStatus(  # type: ignore[attr-defined]
+            False, False, False, False, False, False
+        )
+        self.assertTrue(engine_declares_aggregate_shutdown_status(engine))
+
+    def test_undeclared_dynamic_mock_has_no_aggregate_api(self) -> None:
+        tts = MagicMock()
+        self.assertFalse(engine_declares_aggregate_shutdown_status(tts))
+        self.assertFalse(
+            engine_declares_shutdown_api(tts, "local_cosyvoice_shutdown_status")
+        )
+
+    def test_noncallable_declared_aggregate_fails_shutdown(self) -> None:
+        class Engine:
+            engine_type = "edge-tts"
+            get_shutdown_status = None
+
+            def shutdown(self) -> None:
+                pass
+
+        assistant = TtsShutdownPropagationTests()._assistant(tts_engine=Engine())
+        assistant.shutdown()
+        self.assertFalse(assistant._tts_shutdown_done)  # noqa: SLF001
+
+    def test_explicit_instance_mock_getter_respected(self) -> None:
+        tts = MagicMock()
+        tts.shutdown = MagicMock()
+        tts.get_shutdown_status = lambda: TtsShutdownStatus(
+            False, False, False, False, False, False
+        )
+        assistant = TtsShutdownPropagationTests()._assistant(tts_engine=tts)
+        assistant.shutdown()
+        self.assertFalse(assistant._tts_shutdown_done)  # noqa: SLF001
+
+    def test_legacy_without_declared_getters_still_succeeds(self) -> None:
+        class Legacy:
+            engine_type = "edge-tts"
+
+            def shutdown(self) -> None:
+                pass
+
+        assistant = TtsShutdownPropagationTests()._assistant(tts_engine=Legacy())
+        assistant.shutdown()
+        self.assertTrue(assistant._tts_shutdown_done)  # noqa: SLF001
+
+
+class LegacyBoundPlaybackTests(unittest.TestCase):
+    """非流 ``process_text_input`` 复用 TurnSpeechPlayer，无逐回复 daemon 线程。"""
+
+    def _assistant(
+        self,
+        *,
+        router: Any,
+        tts: Any,
+        config: Optional[MemoryConfig] = None,
+        character_interface: Optional[FakeCharacter] = None,
+    ) -> MikuAssistant:
+        cfg = config or MemoryConfig({"assistant": {"auto_tts": True}})
+        assistant = MikuAssistant.from_dependencies(
+            cfg,
+            router=router,  # type: ignore[arg-type]
+            tts_engine=tts,
+            character_interface=character_interface,
+        )
+        self.addCleanup(_shutdown_assistant_with_player, assistant)
+        return assistant
+
+    def test_burst_returns_immediately_single_consumer_bounded_pending(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        spoken: List[str] = []
+
+        class GatedTTS:
+            def speak(self, text: str) -> None:
+                spoken.append(text)
+                entered.set()
+                if not release.wait(timeout=5.0):
+                    raise TimeoutError("release")
+
+            def shutdown(self) -> None:
+                return None
+
+        router = FakeRouter("Miku: hold")
+        assistant = self._assistant(router=router, tts=GatedTTS())
+        self.addCleanup(_shutdown_assistant_with_player, assistant, release=release)
+        self.assertEqual(assistant.process_text_input("first", use_tts=True), "Miku: hold")
+        self.assertTrue(entered.wait(timeout=3.0), "consumer should enter speak")
+        player = assistant._speech_player  # noqa: SLF001
+        self.assertIsNotNone(player)
+
+        for i in range(200):
+            reply = assistant.process_text_input(f"burst-{i}", use_tts=True)
+            self.assertEqual(reply, "Miku: hold")
+
+        consumers = [
+            t
+            for t in threading.enumerate()
+            if t.name == "TurnSpeechPlayer" and t.is_alive()
+        ]
+        self.assertEqual(len(consumers), 1)
+
+        active = assistant._active_turn  # noqa: SLF001
+        assert player is not None and active is not None and active.speech_turn_id
+        release.set()
+        status = player.wait_for_turn(active.speech_turn_id, timeout=5.0)
+        self.assertIn(
+            status,
+            (PlaybackStatus.COMPLETED, PlaybackStatus.INVALIDATED),
+        )
+        self.assertIn("hold", spoken[-1] if spoken else "")
+
+    def test_stale_turn_side_effect_does_not_claim_active(self) -> None:
+        tts = FakeTTS()
+        assistant = self._assistant(router=FakeRouter("ok"), tts=tts)
+        stale = assistant._begin_generation_turn(external_cancel=None)  # noqa: SLF001
+        assert stale is not None
+        assistant._begin_generation_turn(external_cancel=None)  # noqa: SLF001
+        outcome = DispatchOutcome(text="Miku: late", allow_tts=True, allow_character=False)
+        assistant._apply_outcome_side_effects(  # noqa: SLF001
+            outcome, use_tts=True, use_legacy_thread=True, turn=stale
+        )
+        self.assertEqual(tts.speak_calls, [])
+        self.assertFalse(stale.speech_turn_id)
+
+    def test_latest_turn_plays_after_rapid_inputs(self) -> None:
+        release = threading.Event()
+        spoken: List[str] = []
+
+        class GatedTTS:
+            def speak(self, text: str) -> None:
+                spoken.append(text)
+                if not release.wait(timeout=5.0):
+                    raise TimeoutError("release")
+
+            def shutdown(self) -> None:
+                return None
+
+        class CountRouter:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def dispatch(self, text: str) -> str:
+                self.n += 1
+                return f"Miku: line-{self.n}"
+
+        router = CountRouter()
+        assistant = self._assistant(router=router, tts=GatedTTS())
+        release.set()
+        for _ in range(5):
+            assistant.process_text_input("x", use_tts=True)
+        active = assistant._active_turn  # noqa: SLF001
+        assert active is not None
+        player = assistant._speech_player  # noqa: SLF001
+        assert player is not None
+        status = player.wait_for_turn(active.speech_turn_id, timeout=3.0)
+        self.assertEqual(status, PlaybackStatus.COMPLETED)
+        self.assertEqual(spoken[-1], "line-5")
+
+    def test_allow_tts_false_skips_player(self) -> None:
+        class SilentRouter:
+            def dispatch_outcome(self, text: str) -> DispatchOutcome:
+                return DispatchOutcome(
+                    text="Miku: quiet",
+                    allow_tts=False,
+                    allow_character=False,
+                )
+
+        tts = FakeTTS()
+        assistant = self._assistant(router=SilentRouter(), tts=tts)
+        self.assertEqual(assistant.process_text_input("q", use_tts=True), "Miku: quiet")
+        self.assertEqual(tts.speak_calls, [])
+        self.assertIsNone(assistant._speech_player)  # noqa: SLF001
+
+    def test_shutdown_waits_player_then_retries(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        spoken: List[str] = []
+
+        class GatedTTS:
+            def speak(self, text: str) -> None:
+                spoken.append(text)
+                entered.set()
+                if not release.wait(timeout=5.0):
+                    raise TimeoutError("release")
+
+            def shutdown(self) -> None:
+                return None
+
+        assistant = self._assistant(router=FakeRouter("Miku: bye"), tts=GatedTTS())
+        self.addCleanup(_shutdown_assistant_with_player, assistant, release=release)
+        assistant.process_text_input("z", use_tts=True)
+        self.assertTrue(entered.wait(timeout=3.0), "speak should start")
+        player = assistant._speech_player  # noqa: SLF001
+        assert player is not None
+        self.assertFalse(player.shutdown(timeout=0.05))
+        release.set()
+        self.assertTrue(player.shutdown(timeout=3.0))
+
+    def test_legacy_enqueue_bootstrap_runtimeerror_keeps_reply_and_character(
+        self,
+    ) -> None:
+        character = FakeCharacter()
+        router = FakeRouter("Miku: spoken")
+        logger = MagicMock()
+        cfg = MemoryConfig({"assistant": {"auto_tts": True}})
+        assistant = MikuAssistant.from_dependencies(
+            cfg,
+            router=router,  # type: ignore[arg-type]
+            tts_engine=FakeTTS(),
+            character_interface=character,
+            logger=logger,
+        )
+        self.addCleanup(_shutdown_assistant_with_player, assistant)
+        boom = RuntimeError("owned start failed")
+
+        def fail_start(_self: OwnedThreadTask) -> bool:
+            raise boom
+
+        with patch.object(OwnedThreadTask, "start", fail_start):
+            text = assistant.process_text_input("q", use_tts=True)
+        self.assertEqual(text, "Miku: spoken")
+        self.assertEqual(character.messages, ["Miku: spoken"])
+        active = assistant._active_turn  # noqa: SLF001
+        assert active is not None
+        self.assertFalse(active.speech_turn_id)
+        logger.error.assert_called()
+        self.assertIn("非流播报失败", logger.error.call_args[0][0])
+
+    def test_legacy_enqueue_bootstrap_keyboard_interrupt_reraises_after_release(
+        self,
+    ) -> None:
+        ki = KeyboardInterrupt("bootstrap")
+        assistant = self._assistant(router=FakeRouter("x"), tts=FakeTTS())
+        with patch.object(OwnedThreadTask, "start", side_effect=ki):
+            with self.assertRaises(KeyboardInterrupt) as ctx:
+                assistant.process_text_input("q", use_tts=True)
+            self.assertIs(ctx.exception, ki)
+        active = assistant._active_turn  # noqa: SLF001
+        assert active is not None
+        self.assertFalse(active.speech_turn_id)
+
+    def test_legacy_enqueue_bootstrap_system_exit_reraises_after_release(self) -> None:
+        exit_obj = SystemExit(9)
+        assistant = self._assistant(router=FakeRouter("x"), tts=FakeTTS())
+        with patch.object(OwnedThreadTask, "start", side_effect=exit_obj):
+            with self.assertRaises(SystemExit) as ctx:
+                assistant.process_text_input("q", use_tts=True)
+            self.assertIs(ctx.exception, exit_obj)
+        active = assistant._active_turn  # noqa: SLF001
+        assert active is not None
+        self.assertFalse(active.speech_turn_id)
+
+    def test_legacy_enqueue_bootstrap_generator_exit_reraises_after_release(
+        self,
+    ) -> None:
+        assistant = self._assistant(router=FakeRouter("x"), tts=FakeTTS())
+
+        def fail_start(_self: OwnedThreadTask) -> bool:
+            raise GeneratorExit()
+
+        with patch.object(OwnedThreadTask, "start", fail_start):
+            with self.assertRaises(GeneratorExit):
+                assistant.process_text_input("q", use_tts=True)
+        active = assistant._active_turn  # noqa: SLF001
+        assert active is not None
+        self.assertFalse(active.speech_turn_id)
+
+    def test_legacy_enqueue_bootstrap_custom_base_exception_reraises(self) -> None:
+        class CustomFatal(BaseException):
+            pass
+
+        fatal = CustomFatal("bootstrap-fatal")
+        assistant = self._assistant(router=FakeRouter("x"), tts=FakeTTS())
+        with patch.object(OwnedThreadTask, "start", side_effect=fatal):
+            with self.assertRaises(CustomFatal) as ctx:
+                assistant.process_text_input("q", use_tts=True)
+            self.assertIs(ctx.exception, fatal)
+        active = assistant._active_turn  # noqa: SLF001
+        assert active is not None
+        self.assertFalse(active.speech_turn_id)
 
 
 class DefaultAssemblyWiringTests(unittest.TestCase):
@@ -498,7 +972,7 @@ class DefaultAssemblyWiringTests(unittest.TestCase):
         config = MemoryConfig(
             {
                 "ollama": {
-                    "base_url": "http://x",
+                    "base_url": "http://127.0.0.1:9",
                     "model": "m",
                     "timeout": 9,
                     "keep_alive": "15m",
@@ -601,7 +1075,7 @@ class DefaultAssemblyWiringTests(unittest.TestCase):
         self.assertEqual(recorded["config_path"], "cfg.yaml")
         self.assertTrue(recorded["dirs"])
         self.assertIs(recorded["logged"], config)
-        self.assertEqual(recorded["ollama"]["base_url"], "http://x")
+        self.assertEqual(recorded["ollama"]["base_url"], "http://127.0.0.1:9")
         self.assertEqual(recorded["ollama"]["model"], "m")
         self.assertEqual(recorded["ollama"]["keep_alive"], "15m")
         recorded["llm_obj"].start_warmup.assert_called_once_with(timeout=42.0)

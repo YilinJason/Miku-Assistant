@@ -13,12 +13,33 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import requests
 
+from src.core.network_endpoint import (
+    SealedModelEndpoint,
+    authorize_model_endpoint,
+    best_effort_close_response,
+    enforce_no_redirect,
+    reseal_model_endpoint,
+)
+from src.core.log_privacy import exception_log_label
+from src.core.companion import compose_system_prompt, normalize_base_system
+from src.core.model_memory_admission import (
+    LocalModelMemoryAdmission,
+    ModelMemoryAdmissionError,
+    payload_exempt_from_model_admission,
+)
+from src.core.owned_thread import OwnedThreadTask
+from src.core.resource_settings import (
+    DEFAULT_FOREGROUND_WARMUP_WAIT_SEC,
+    MAX_FOREGROUND_WARMUP_WAIT_SEC,
+)
 from src.llm.conversation_history import (
     DEFAULT_MAX_STORED_TURNS,
     ConversationHistory,
@@ -26,6 +47,19 @@ from src.llm.conversation_history import (
 )
 from src.llm.generate_result import GenerateResult, GenerateStatus
 from src.llm.stream_events import StreamEvent
+
+
+@dataclass(frozen=True)
+class OllamaWarmupSnapshot:
+    """只读后台预热代际快照；不含请求正文或模型回复。"""
+
+    generation: int
+    finished: bool
+    succeeded: bool
+
+
+class _WarmupPostAborted(Exception):
+    """准入通过后、POST 前因 ``close_warmup`` 取消暖机加载。"""
 
 
 class OllamaClient:
@@ -45,6 +79,12 @@ class OllamaClient:
         history: Optional[ConversationHistory] = None,
         keep_alive: Any = None,
         max_stored_turns: Optional[int] = None,
+        *,
+        safety_policy: Optional[Any] = None,
+        sealed_endpoint: Optional[SealedModelEndpoint] = None,
+        foreground_warmup_wait_sec: Optional[float] = None,
+        base_system: Optional[str] = None,
+        model_memory_guard: Optional[LocalModelMemoryAdmission] = None,
     ):
         """
         初始化 Ollama 客户端。
@@ -58,11 +98,28 @@ class OllamaClient:
                 保持服务端默认值。
             max_stored_turns: 仅在未注入 ``history`` 时生效；默认
                 ``DEFAULT_MAX_STORED_TURNS``。
+            safety_policy: 装配共享策略；省略时仅允许 loopback 端点。
+            sealed_endpoint: 已授权封存端点；传入时仍会按 ``base_url`` 重新分类
+                并授权，绝不信任调用方声称的 ``kind``。
+            foreground_warmup_wait_sec: 正式请求等待后台预热的短上限（秒）；
+                与资源协调 ``resource.warmup.timeout`` 分离；默认 5，硬上限 10。
+            base_system: 可选基础人格 system；在 ``_build_chat_messages`` 与
+                调用方动态 system 合成恰好一条 ``role=system``；``None``/空保持兼容。
+            model_memory_guard: 可选共享本地模型内存准入；``None`` 保持测试/库兼容。
         """
-        self.base_url = base_url.rstrip("/")
+        if sealed_endpoint is not None:
+            self._endpoint = reseal_model_endpoint(
+                safety_policy, sealed_endpoint, context="ollama_client"
+            )
+        else:
+            self._endpoint = authorize_model_endpoint(
+                safety_policy, base_url, context="ollama_client"
+            )
+        self.base_url = self._endpoint.base_url
         self.model = model
         self.timeout = timeout
         self.keep_alive = keep_alive
+        self.safety_policy = safety_policy
         self.logger = logging.getLogger(__name__)
         if history is not None:
             self._history = history
@@ -76,11 +133,109 @@ class OllamaClient:
             )
             self._history = ConversationHistory(max_stored_turns=turns)
         self._warmup_lock = threading.Lock()
+        self._warmup_state_cv = threading.Condition(self._warmup_lock)
         self._warmup_done = threading.Event()
-        self._warmup_thread: Optional[threading.Thread] = None
+        self._warmup_owner: Optional[OwnedThreadTask] = None
         self._warmup_ok: Optional[bool] = None
-        self._warmup_wait_timeout = max(1.0, float(timeout)) + 5.0
+        self._warmup_active_generation = 0
+        self._warmup_closing = False
+        self._warmup_start_pending = False
+        # 资源协调 wait_for_warmup(timeout=None) 的回退；不用于正式请求前台等待
+        self._resource_warmup_wait_timeout = max(1.0, float(timeout)) + 5.0
+        self._foreground_warmup_wait_sec = self._normalize_foreground_warmup_wait(
+            foreground_warmup_wait_sec
+        )
+        self._base_system = normalize_base_system(base_system)
         self._model_touch_succeeded = False
+        self._model_memory_guard = model_memory_guard
+
+    def _enforce_model_post_admission(
+        self, payload: Dict[str, Any], *, call_timeout: Optional[float] = None
+    ) -> None:
+        guard = self._model_memory_guard
+        if guard is None or payload_exempt_from_model_admission(payload):
+            return
+        model = payload.get("model")
+        if not isinstance(model, str) or not model.strip():
+            model = self.model
+        effective = (
+            float(self.timeout)
+            if call_timeout is None
+            else float(call_timeout)
+        )
+        guard.require_model_post(
+            model,
+            call_timeout=effective,
+            sealed_endpoint=self._endpoint,
+        )
+
+    @staticmethod
+    def _resource_failure_detail(exc: ModelMemoryAdmissionError) -> str:
+        return exc.user_message
+
+    @staticmethod
+    def _normalize_foreground_warmup_wait(value: Optional[float]) -> float:
+        if value is None:
+            return float(DEFAULT_FOREGROUND_WARMUP_WAIT_SEC)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "foreground_warmup_wait_sec must be a finite number, "
+                f"got {type(value).__name__}"
+            )
+        number = float(value)
+        if (
+            not math.isfinite(number)
+            or number <= 0.0
+            or number > float(MAX_FOREGROUND_WARMUP_WAIT_SEC)
+        ):
+            raise ValueError(
+                "foreground_warmup_wait_sec must be a finite number in "
+                f"(0, {MAX_FOREGROUND_WARMUP_WAIT_SEC:g}]"
+            )
+        return number
+
+    @property
+    def endpoint_kind(self) -> str:
+        return self._endpoint.kind.value
+
+    def _chat_url(self) -> str:
+        return self._endpoint.api_url("/api/chat")
+
+    def _tags_url(self) -> str:
+        return self._endpoint.api_url("/api/tags")
+
+    def _request_post(self, url: str, **kwargs: Any) -> Any:
+        """所有 POST 禁止自动 redirect；3xx 先 close 再拒绝。chat 加载统一经内存准入。"""
+        kwargs.setdefault("allow_redirects", False)
+        if url == self._chat_url():
+            payload = kwargs.get("json")
+            if isinstance(payload, dict):
+                raw_timeout = kwargs.get("timeout", self.timeout)
+                effective = (
+                    float(self.timeout)
+                    if raw_timeout is None
+                    else float(raw_timeout)
+                )
+                if not payload_exempt_from_model_admission(payload):
+                    self._enforce_model_post_admission(
+                        payload, call_timeout=effective
+                    )
+                    if payload.get("messages") == []:
+                        with self._warmup_lock:
+                            if self._warmup_closing:
+                                raise _WarmupPostAborted()
+        post = getattr(self, "_http_post", None) or requests.post
+        response = post(url, **kwargs)
+        enforce_no_redirect(response)
+        return response
+
+    def _request_get(self, url: str, **kwargs: Any) -> Any:
+        """所有 GET 禁止自动 redirect；3xx 先 close 再拒绝。不吞 TypeError 重试。"""
+        kwargs.setdefault("allow_redirects", False)
+        get = getattr(self, "_http_get", None) or requests.get
+        response = get(url, **kwargs)
+        enforce_no_redirect(response)
+        return response
 
     def _mark_model_touched(self) -> None:
         """记录本客户端曾成功触达模型（预热或正式请求）。"""
@@ -101,28 +256,37 @@ class OllamaClient:
         """
         构造 ``/api/chat`` 的 ``messages``：可选 system → 历史窗口 → 当前 user。
 
-        - 非空 ``system`` 插入为 ``messages[0]``（``role=system``）。
-        - ``None`` 或空字符串不插入 system，保持历史 + 当前 user。
+        - 将客户端 ``base_system`` 与调用方动态 ``system`` 合成**恰好一条**
+          ``role=system``（基础人格在前，动态可信上下文在后）。
+        - ``None`` 或空字符串不参与合成；两者皆无则不插入 system。
         - 返回独立列表/字典副本；不修改 ``ConversationHistory`` 内部记录。
-        流式与非流式路径必须共用本边界，避免协议漂移。
+        - 流式与非流式路径必须共用本边界，避免协议漂移。
         """
         messages = self._history.build_messages(prompt)
-        if system:
-            messages.insert(0, {"role": "system", "content": system})
+        composed = compose_system_prompt(self._base_system, system)
+        if composed:
+            messages.insert(0, {"role": "system", "content": composed})
         return messages
 
     def warm_up(self, *, timeout: Optional[float] = None) -> bool:
         """发送空 chat 请求预载模型；不读取或修改会话历史。"""
-        url = f"{self.base_url}/api/chat"
+        with self._warmup_lock:
+            if self._warmup_closing:
+                return False
+        url = self._chat_url()
         payload = self._apply_runtime_options(
             {"model": self.model, "messages": [], "stream": False}
         )
+        effective_timeout = (
+            float(self.timeout) if timeout is None else float(timeout)
+        )
         started = time.perf_counter()
+        response: Optional[requests.Response] = None
         try:
-            response = requests.post(
+            response = self._request_post(
                 url,
                 json=payload,
-                timeout=timeout if timeout is not None else self.timeout,
+                timeout=effective_timeout,
             )
             response.raise_for_status()
             data = response.json()
@@ -135,55 +299,288 @@ class OllamaClient:
                 (time.perf_counter() - started) * 1000,
             )
             return True
+        except _WarmupPostAborted:
+            return False
+        except ModelMemoryAdmissionError as exc:
+            self.logger.warning(
+                "Ollama 模型预热因资源准入被拒绝 reason=%s",
+                exc.reason,
+            )
+            return False
         except Exception as exc:
             # 预热是性能优化；失败不影响稍后的正式请求与原错误契约。
             self.logger.warning(
-                "Ollama 模型预热失败（正式请求仍可继续）: %s", exc
+                "Ollama 模型预热失败（正式请求仍可继续） err=%s",
+                exception_log_label(exc),
             )
             return False
+        finally:
+            best_effort_close_response(response)
 
-    def start_warmup(self, *, timeout: Optional[float] = None) -> bool:
-        """幂等启动后台预热；返回本次是否创建了新线程。"""
+    def _warmup_lifecycle_busy_locked(self) -> bool:
+        """调用方须已持有 ``_warmup_lock``。"""
+        if self._warmup_start_pending:
+            return True
+        owner = self._warmup_owner
+        if owner is None:
+            return False
+        snap = owner.snapshot()
+        if snap.creator_pending:
+            return True
+        return not snap.quiet
+
+    def _make_warmup_runner(
+        self, generation: int, effective_timeout: float
+    ) -> Callable[[threading.Event], None]:
+        def _run(cancel: threading.Event) -> None:
+            ok = False
+            cancelled = False
+            closing = False
+            try:
+                if cancel.is_set():
+                    cancelled = True
+                    return
+                with self._warmup_lock:
+                    closing = self._warmup_closing
+                if closing:
+                    return
+                ok = self.warm_up(timeout=effective_timeout)
+                if cancel.is_set():
+                    cancelled = True
+                    ok = False
+                else:
+                    with self._warmup_lock:
+                        if self._warmup_closing:
+                            closing = True
+                            ok = False
+            finally:
+                with self._warmup_lock:
+                    if generation != self._warmup_active_generation:
+                        pass
+                    else:
+                        owner = self._warmup_owner
+                        if owner is not None and owner.error is not None:
+                            self._warmup_ok = False
+                        elif cancelled or closing or self._warmup_closing:
+                            self._warmup_ok = False
+                        else:
+                            self._warmup_ok = ok
+                        self._warmup_done.set()
+                        self._notify_warmup_waiters_locked()
+
+        return _run
+
+    def _notify_warmup_waiters_locked(self) -> None:
+        """调用方须已持有 ``_warmup_lock``。"""
+        self._warmup_state_cv.notify_all()
+
+    def _prepare_new_warmup_generation_locked(
+        self, effective_timeout: float
+    ) -> tuple[OwnedThreadTask, int]:
+        """在已持有 ``_warmup_lock`` 时发布新 owner（尚未 ``start``）。"""
+        generation = self._warmup_active_generation + 1
+        owner = OwnedThreadTask(
+            self._make_warmup_runner(generation, effective_timeout),
+            name="OllamaWarmup",
+        )
+        self._warmup_active_generation = generation
+        self._warmup_done.clear()
+        self._warmup_ok = None
+        self._warmup_start_pending = True
+        self._warmup_owner = owner
+        return owner, generation
+
+    def _start_published_warmup_owner(self, owner: OwnedThreadTask) -> bool:
+        """``Thread.start`` 须在 warmup 锁外；``finally`` 清除 start_pending。"""
+        ack = False
+        try:
+            ack = owner.start()
+        finally:
+            with self._warmup_lock:
+                self._warmup_start_pending = False
+                if self._warmup_closing and self._warmup_owner is owner:
+                    owner.cancel()
+                self._notify_warmup_waiters_locked()
+        return ack
+
+    def _warmup_work_finished_locked(self) -> bool:
+        """调用方须已持有 ``_warmup_lock``；预热工作任务是否已结束。"""
+        if self._warmup_start_pending:
+            return False
+        owner = self._warmup_owner
+        if owner is None:
+            return False
+        snap = owner.snapshot()
+        if snap.creator_pending or not snap.quiet:
+            return False
+        return self._warmup_done.is_set()
+
+    def _warmup_snapshot_locked(self) -> OllamaWarmupSnapshot:
+        """调用方须已持有 ``_warmup_lock``。"""
+        owner = self._warmup_owner
+        generation = self._warmup_active_generation
+        finished = self._warmup_work_finished_locked()
+        succeeded = (
+            finished
+            and bool(self._warmup_ok)
+            and not self._warmup_closing
+            and (owner is None or owner.error is None)
+        )
+        return OllamaWarmupSnapshot(
+            generation=generation,
+            finished=finished,
+            succeeded=succeeded,
+        )
+
+    def warmup_snapshot(self) -> OllamaWarmupSnapshot:
+        """返回当前预热代际的不可变快照。"""
         with self._warmup_lock:
-            if self._warmup_thread is not None or self._warmup_done.is_set():
+            return self._warmup_snapshot_locked()
+
+    def close_warmup(self, timeout: float = 2.0) -> bool:
+        """
+        永久结束本客户端的后台预热能力；有界等待 owner quiet。
+
+        严格 ``True`` 表示无 pending creator/start 且 owner 已 quiet；``False`` 可重试。
+        不卸载模型、不停止 Ollama 服务。
+        """
+        with self._warmup_lock:
+            self._warmup_closing = True
+            owner = self._warmup_owner
+        if owner is not None:
+            owner.cancel()
+        if owner is None:
+            with self._warmup_lock:
+                if self._warmup_start_pending:
+                    return False
+            return True
+        if not owner.join(timeout=timeout):
+            return False
+        with self._warmup_lock:
+            if self._warmup_start_pending:
                 return False
+            if self._warmup_owner is not owner:
+                return False
+            snap = owner.snapshot()
+            if snap.creator_pending:
+                return False
+            return snap.quiet
+
+    def begin_fresh_warmup(self, *, timeout: Optional[float] = None) -> int:
+        """
+        原子开启或复用当前进行中的预热代际，并返回其 generation。
+
+        与 ``start_warmup`` 分离，避免先返回 bool 再读快照产生竞态。
+        """
+        with self._warmup_lock:
+            if self._warmup_closing:
+                return 0
+            if self._warmup_lifecycle_busy_locked():
+                return self._warmup_active_generation
+            if self._warmup_done.is_set():
+                self._warmup_done.clear()
+            effective_timeout = self.timeout if timeout is None else timeout
+            self._resource_warmup_wait_timeout = (
+                max(1.0, float(effective_timeout)) + 5.0
+            )
+            owner, generation = self._prepare_new_warmup_generation_locked(
+                float(effective_timeout)
+            )
+        if not self._start_published_warmup_owner(owner):
+            return 0
+        return generation
+
+    def start_warmup(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        restart: bool = False,
+    ) -> bool:
+        """幂等启动后台预热；``restart=True`` 时仅在旧 owner quiet 后开启新代际。"""
+        with self._warmup_lock:
+            if self._warmup_closing:
+                return False
+            if self._warmup_lifecycle_busy_locked():
+                return False
+            if not restart:
+                if self._warmup_done.is_set():
+                    return False
+                prior = self._warmup_owner
+                if prior is not None:
+                    snap = prior.snapshot()
+                    if not snap.quiet:
+                        return False
+                    if snap.start_unknown or snap.alive or snap.entered:
+                        return False
+            elif self._warmup_done.is_set():
+                self._warmup_done.clear()
+                self._warmup_ok = None
 
             effective_timeout = self.timeout if timeout is None else timeout
-            self._warmup_wait_timeout = max(1.0, float(effective_timeout)) + 5.0
-
-            def _run() -> None:
-                try:
-                    self._warmup_ok = self.warm_up(timeout=effective_timeout)
-                finally:
-                    self._warmup_done.set()
-
-            thread = threading.Thread(
-                target=_run,
-                name="OllamaWarmup",
-                daemon=True,
+            self._resource_warmup_wait_timeout = (
+                max(1.0, float(effective_timeout)) + 5.0
             )
-            self._warmup_thread = thread
-            try:
-                thread.start()
-            except Exception:
-                # 创建成功但 start 失败时恢复成可重试状态；否则正式请求会把
-                # 一个从未运行的线程误认为在预热并等待到超时。
-                self._warmup_thread = None
-                self._warmup_ok = False
-                raise
-            return True
+            owner, _generation = self._prepare_new_warmup_generation_locked(
+                float(effective_timeout)
+            )
+        return self._start_published_warmup_owner(owner)
 
     def wait_for_warmup(self, *, timeout: Optional[float] = None) -> bool:
-        """有界等待后台预热结束；供资源协调器串行 RVC 前调用。"""
+        """有界等待后台预热 owner quiet；供资源协调器串行 RVC 前调用。"""
         wait_timeout = (
-            self._warmup_wait_timeout if timeout is None else max(1.0, float(timeout))
+            self._resource_warmup_wait_timeout
+            if timeout is None
+            else max(0.0, float(timeout))
         )
-        thread = self._warmup_thread
-        if thread is None and not self._warmup_done.is_set():
-            return True
-        if self._warmup_done.is_set():
-            return True
-        return bool(self._warmup_done.wait(timeout=wait_timeout))
+        deadline = time.monotonic() + wait_timeout
+        while True:
+            with self._warmup_lock:
+                owner = self._warmup_owner
+                if owner is None and not self._warmup_done.is_set():
+                    return True
+                if self._warmup_work_finished_locked():
+                    return True
+                if (
+                    owner is not None
+                    and not self._warmup_start_pending
+                ):
+                    snap = owner.snapshot()
+                    if (
+                        snap.quiet
+                        and not snap.creator_pending
+                        and not self._warmup_done.is_set()
+                    ):
+                        return True
+                pending = self._warmup_start_pending
+                join_owner = None if pending else owner
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                if pending or join_owner is None:
+                    self._warmup_state_cv.wait(timeout=min(0.05, remaining))
+                    continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            snap = join_owner.snapshot()
+            if snap.quiet and not snap.creator_pending:
+                with self._warmup_lock:
+                    if self._warmup_work_finished_locked():
+                        return True
+                    if (
+                        not self._warmup_done.is_set()
+                        and join_owner is self._warmup_owner
+                        and join_owner.snapshot().quiet
+                    ):
+                        return True
+                continue
+            if not join_owner.join(timeout=min(0.1, remaining)):
+                with self._warmup_lock:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return False
+                    self._warmup_state_cv.wait(timeout=min(0.05, remaining))
+                continue
 
     def release_owned_model(self) -> bool:
         """
@@ -197,7 +594,7 @@ class OllamaClient:
                 "跳过 keep_alive=0：本客户端未曾成功触达模型"
             )
             return False
-        url = f"{self.base_url}/api/chat"
+        url = self._chat_url()
         payload = {
             "model": self.model,
             "messages": [],
@@ -205,9 +602,11 @@ class OllamaClient:
             "keep_alive": 0,
         }
         started = time.perf_counter()
+        response: Optional[requests.Response] = None
         try:
-            post = getattr(self, "_http_post", None) or requests.post
-            response = post(url, json=payload, timeout=min(30.0, float(self.timeout)))
+            response = self._request_post(
+                url, json=payload, timeout=min(30.0, float(self.timeout))
+            )
             response.raise_for_status()
             self.logger.info(
                 "[Ollama计时] best-effort keep_alive=0: %.0f ms "
@@ -216,28 +615,49 @@ class OllamaClient:
             )
             return True
         except Exception as exc:
-            self.logger.warning("keep_alive=0 卸载请求失败: %s", exc)
+            self.logger.warning(
+                "keep_alive=0 卸载请求失败 err=%s", exception_log_label(exc)
+            )
             return False
+        finally:
+            best_effort_close_response(response)
 
     def _wait_for_warmup(self) -> None:
-        """正式请求与后台预热重叠时等待同一次模型加载，避免重复争用资源。"""
-        thread = self._warmup_thread
-        if (
-            thread is None
-            or thread is threading.current_thread()
-            or self._warmup_done.is_set()
-        ):
+        """
+        正式请求前短等待后台预热（独立于资源协调 timeout）。
+
+        超时后允许正式请求继续；可能短暂与尚未返回的空预热 HTTP 重叠，
+        但不新建模型进程，由 Ollama 服务自行串行同模型请求。
+        """
+        with self._warmup_lock:
+            if self._warmup_closing or self._warmup_work_finished_locked():
+                return
+            owner = self._warmup_owner
+        if owner is None:
             return
         started = time.perf_counter()
-        completed = self._warmup_done.wait(timeout=self._warmup_wait_timeout)
-        if not completed:
+        budget = self._foreground_warmup_wait_sec
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            with self._warmup_lock:
+                if self._warmup_work_finished_locked():
+                    break
+                pending = self._warmup_start_pending
+            if not pending:
+                break
+            time.sleep(min(0.02, deadline - time.monotonic()))
+        remaining = max(0.0, deadline - time.monotonic())
+        quiet = owner.join(timeout=remaining)
+        status = "ready" if quiet else "timeout"
+        if not quiet:
             self.logger.warning(
-                "Ollama 后台预热等待超时，正式请求将独立继续"
+                "Ollama 后台预热等待超时，正式请求将独立继续 status=%s",
+                status,
             )
         self.logger.info(
             "[Ollama计时] 等待后台预热: %.0f ms status=%s",
             (time.perf_counter() - started) * 1000,
-            self._warmup_ok,
+            status,
         )
 
     @property
@@ -277,7 +697,7 @@ class OllamaClient:
         仅 ``SUCCESS``（非空文本）时提交完整一轮历史。失败与空回复不修改历史。
         不根据文本是否以「错误:」开头判断成败。
         """
-        url = f"{self.base_url}/api/chat"
+        url = self._chat_url()
         self._wait_for_warmup()
         messages = self._build_chat_messages(prompt, system=system)
 
@@ -287,8 +707,9 @@ class OllamaClient:
             "stream": stream,
         })
 
+        response: Optional[requests.Response] = None
         try:
-            response = requests.post(url, json=payload, timeout=self.timeout)
+            response = self._request_post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
             self._mark_model_touched()
 
@@ -308,37 +729,65 @@ class OllamaClient:
                 return result
             return GenerateResult.empty()
 
+        except ModelMemoryAdmissionError as exc:
+            self.logger.warning(
+                "Ollama 生成因资源准入被拒绝 reason=%s", exc.reason
+            )
+            return GenerateResult.failure(
+                GenerateStatus.RESOURCE_ERROR,
+                self._resource_failure_detail(exc),
+            )
+        except PermissionError as exc:
+            self.logger.error(
+                "Ollama API请求失败 err=%s", exception_log_label(exc)
+            )
+            return GenerateResult.failure(
+                GenerateStatus.HTTP_ERROR,
+                self._exception_detail(exc, "HTTP redirect 被拒绝"),
+            )
         except requests.exceptions.Timeout as exc:
-            self.logger.error("Ollama API请求失败: %s", exc)
+            self.logger.error(
+                "Ollama API请求失败 err=%s", exception_log_label(exc)
+            )
             return GenerateResult.failure(
                 GenerateStatus.TIMEOUT,
                 self._exception_detail(exc, "请求超时"),
             )
         except requests.exceptions.HTTPError as exc:
-            self.logger.error("Ollama API请求失败: %s", exc)
+            self.logger.error(
+                "Ollama API请求失败 err=%s", exception_log_label(exc)
+            )
             return GenerateResult.failure(
                 GenerateStatus.HTTP_ERROR,
                 self._exception_detail(exc, "HTTP 错误"),
             )
         except requests.exceptions.JSONDecodeError as exc:
             # 必须在宽泛 RequestException 之前：该类同时是 RequestException 子类
-            self.logger.error("生成回复时出错: %s", exc)
+            self.logger.error(
+                "生成回复时出错 err=%s", exception_log_label(exc)
+            )
             return GenerateResult.failure(
                 GenerateStatus.RESPONSE_ERROR,
                 self._exception_detail(exc, "响应 JSON 解析失败"),
             )
         except requests.exceptions.RequestException as exc:
-            self.logger.error("Ollama API请求失败: %s", exc)
+            self.logger.error(
+                "Ollama API请求失败 err=%s", exception_log_label(exc)
+            )
             return GenerateResult.failure(
                 GenerateStatus.CONNECTION_ERROR,
                 self._exception_detail(exc, "连接失败"),
             )
         except Exception as exc:
-            self.logger.error("生成回复时出错: %s", exc)
+            self.logger.error(
+                "生成回复时出错 err=%s", exception_log_label(exc)
+            )
             return GenerateResult.failure(
                 GenerateStatus.RESPONSE_ERROR,
                 self._exception_detail(exc, "响应处理失败"),
             )
+        finally:
+            best_effort_close_response(response)
 
     def generate_stream(
         self, prompt: str, system: Optional[str] = None
@@ -361,7 +810,7 @@ class OllamaClient:
     def _iter_chat_stream(
         self, prompt: str, system: Optional[str] = None
     ) -> Iterator[StreamEvent]:
-        url = f"{self.base_url}/api/chat"
+        url = self._chat_url()
         self._wait_for_warmup()
         messages = self._build_chat_messages(prompt, system=system)
         payload: Dict[str, Any] = self._apply_runtime_options({
@@ -394,12 +843,23 @@ class OllamaClient:
 
         try:
             try:
-                # stream=True：边收边读；旧聚合路径不改此参数
-                response = requests.post(
+                response = self._request_post(
                     url, json=payload, timeout=self.timeout, stream=True
                 )
                 response.raise_for_status()
                 self._mark_model_touched()
+            except ModelMemoryAdmissionError as exc:
+                yield _fail(
+                    GenerateStatus.RESOURCE_ERROR,
+                    self._resource_failure_detail(exc),
+                )
+                return
+            except PermissionError as exc:
+                yield _fail(
+                    GenerateStatus.HTTP_ERROR,
+                    self._exception_detail(exc, "HTTP redirect 被拒绝"),
+                )
+                return
             except requests.exceptions.Timeout as exc:
                 yield _fail(
                     GenerateStatus.TIMEOUT,
@@ -513,11 +973,7 @@ class OllamaClient:
                         self._exception_detail(exc, "流式响应处理失败"),
                     )
         finally:
-            if response is not None:
-                try:
-                    response.close()
-                except Exception:
-                    self.logger.debug("关闭流式 HTTP 响应时忽略异常", exc_info=True)
+            best_effort_close_response(response)
 
     @staticmethod
     def _exception_detail(exc: BaseException, fallback: str) -> str:
@@ -635,13 +1091,16 @@ class OllamaClient:
         Returns:
             ``GET /api/tags`` 成功时为 ``True``。
         """
+        response: Optional[requests.Response] = None
         try:
-            url = f"{self.base_url}/api/tags"
-            response = requests.get(url, timeout=5)
+            url = self._tags_url()
+            response = self._request_get(url, timeout=5)
             response.raise_for_status()
             return True
         except Exception:
             return False
+        finally:
+            best_effort_close_response(response)
 
     def check_model_available(self) -> bool:
         """
@@ -650,9 +1109,10 @@ class OllamaClient:
         Returns:
             模型名完全匹配或基础名（``:`` 前）匹配时为 ``True``。
         """
+        response: Optional[requests.Response] = None
         try:
-            url = f"{self.base_url}/api/tags"
-            response = requests.get(url, timeout=5)
+            url = self._tags_url()
+            response = self._request_get(url, timeout=5)
             response.raise_for_status()
             models = response.json().get("models", [])
             names = {m.get("name", "") for m in models}
@@ -662,8 +1122,12 @@ class OllamaClient:
             base = self.model.split(":")[0]
             return any(n.split(":")[0] == base for n in names)
         except Exception as exc:
-            self.logger.warning("检查模型列表失败: %s", exc)
+            self.logger.warning(
+                "检查模型列表失败 err=%s", exception_log_label(exc)
+            )
             return False
+        finally:
+            best_effort_close_response(response)
 
     def list_models(self) -> List[str]:
         """
@@ -672,13 +1136,16 @@ class OllamaClient:
         Returns:
             模型名字符串列表；请求失败时返回空列表。
         """
+        response: Optional[requests.Response] = None
         try:
-            url = f"{self.base_url}/api/tags"
-            response = requests.get(url, timeout=5)
+            url = self._tags_url()
+            response = self._request_get(url, timeout=5)
             response.raise_for_status()
             return [m.get("name", "") for m in response.json().get("models", [])]
         except Exception:
             return []
+        finally:
+            best_effort_close_response(response)
 
 
 def _format_metric(value: Optional[float]) -> str:

@@ -79,7 +79,7 @@ def _cfg(*, memory_enabled: bool = False, **memory_overrides: Any) -> MemConfig:
     return MemConfig(
         {
             "ollama": {
-                "base_url": "http://x",
+                "base_url": "http://127.0.0.1:9",
                 "model": "m",
                 "timeout": 1,
                 "keep_alive": "30m",
@@ -957,7 +957,7 @@ class ConfigAndRuntimeFaultTests(unittest.TestCase):
         for bad in (float("nan"), float("inf"), True):
             with self.subTest(bad=bad):
                 with self.assertRaises(MemoryValidationError):
-                    RequestsOllamaChatTransport("http://x", timeout=bad)  # type: ignore[arg-type]
+                    RequestsOllamaChatTransport("http://127.0.0.1:9", timeout=bad)  # type: ignore[arg-type]
 
     def test_enabled_invalid_config_fails_before_device_factory(self) -> None:
         device_calls: List[str] = []

@@ -53,7 +53,7 @@ class SearchIntentHandler(IntentHandler):
             return None
 
         if query:
-            self.logger.info("检测到搜索请求: %s", query)
+            self.logger.info("检测到搜索请求 chars=%d", len(query))
         else:
             self.logger.info("检测到打开 Bilibili 首页的请求")
         return self.searcher.search(query)

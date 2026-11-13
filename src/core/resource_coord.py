@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, List, Literal, Optional
 
+from src.core.log_privacy import exception_log_label
 from src.core.resource_settings import ResourceSettings
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ def _wait_ollama_warmup(llm_client: Any, *, timeout: float) -> WarmupWaitResult:
     有界等待 Ollama 预热结束。
 
     普通异常转为 ``failed``（不使装配失败）；``KeyboardInterrupt`` / ``SystemExit`` 上抛。
+    ``detail`` 仅稳定状态标签，不含 ``str(exc)``。
     """
     wait = getattr(llm_client, "wait_for_warmup", None)
     try:
@@ -34,18 +36,18 @@ def _wait_ollama_warmup(llm_client: Any, *, timeout: float) -> WarmupWaitResult:
             finished = wait(timeout=timeout)
             if finished:
                 return WarmupWaitResult("completed")
-            return WarmupWaitResult("timeout", "wait_for_warmup returned False")
+            return WarmupWaitResult("timeout", "wait_for_warmup_false")
         done = getattr(llm_client, "_warmup_done", None)
         if done is not None and hasattr(done, "wait"):
             finished = done.wait(timeout=max(1.0, float(timeout)) + 5.0)
             if finished:
                 return WarmupWaitResult("completed")
-            return WarmupWaitResult("timeout", "_warmup_done.wait timed out")
-        return WarmupWaitResult("skipped", "no wait API")
+            return WarmupWaitResult("timeout", "warmup_event_timeout")
+        return WarmupWaitResult("skipped", "no_wait_api")
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        return WarmupWaitResult("failed", f"{type(exc).__name__}: {exc}")
+        return WarmupWaitResult("failed", exception_log_label(exc))
 
 
 def start_ollama_warmup(
@@ -69,7 +71,10 @@ def start_ollama_warmup(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        log.warning("Ollama 模型后台预热启动失败（正式请求仍可继续）: %s", exc)
+        log.warning(
+            "Ollama 模型后台预热启动失败（正式请求仍可继续） err=%s",
+            exception_log_label(exc),
+        )
     return False
 
 
@@ -93,8 +98,44 @@ def prepare_rvc_if_needed(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        log.warning("RVC 预热失败（正式播报仍可继续）: %s", exc)
+        log.warning(
+            "RVC 预热失败（正式播报仍可继续） err=%s",
+            exception_log_label(exc),
+        )
         return False
+
+
+def wait_ollama_warmup_succeeded_for_explicit_retry(
+    llm_client: Any,
+    *,
+    timeout: float,
+    cancel_event: Any = None,
+) -> WarmupWaitResult:
+    """
+    显式 RVC 重试专用：须 ``begin_fresh_warmup`` + ``warmup_snapshot`` 证明 succeeded。
+
+    不接受仅 ``wait_for_warmup`` 返回 True；缺 API 时 fail-closed。
+    """
+    from src.core.local_voice_warmup import _MONOTONIC, _wait_fresh_ollama
+
+    if cancel_event is not None and cancel_event.is_set():
+        return WarmupWaitResult("failed", "cancelled")
+    snap_fn = getattr(llm_client, "warmup_snapshot", None)
+    begin_fn = getattr(llm_client, "begin_fresh_warmup", None)
+    if not callable(snap_fn) or not callable(begin_fn):
+        return WarmupWaitResult("failed", "ollama_warmup_api_missing")
+    deadline = _MONOTONIC() + float(timeout)
+    ok, detail = _wait_fresh_ollama(
+        llm_client,
+        deadline_mono=deadline,
+        warmup_timeout=float(timeout),
+        cancel_event=cancel_event,
+    )
+    if ok:
+        return WarmupWaitResult("completed")
+    if detail == "cancelled":
+        return WarmupWaitResult("failed", detail)
+    return WarmupWaitResult("failed", detail or "ollama_warmup_failed")
 
 
 def run_coordinated_warmup(
@@ -123,13 +164,13 @@ def run_coordinated_warmup(
         trail.append(f"ollama_wait_{result.status}")
         if result.status == "timeout":
             log.warning(
-                "Ollama 预热等待超时，本轮跳过 RVC 预热以防并行抢 GPU detail=%s",
-                result.detail,
+                "Ollama 预热等待超时，本轮跳过 RVC 预热以防并行抢 GPU status=%s",
+                result.detail or result.status,
             )
         elif result.status == "failed":
             log.warning(
-                "Ollama 预热等待失败，本轮跳过 RVC 预热 detail=%s",
-                result.detail,
+                "Ollama 预热等待失败，本轮跳过 RVC 预热 err=%s",
+                result.detail or result.status,
             )
         return result
 
@@ -195,5 +236,8 @@ def release_owned_ollama_model(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        log.warning("退出时 keep_alive=0 卸载请求失败: %s", exc)
+        log.warning(
+            "退出时 keep_alive=0 卸载请求失败 err=%s",
+            exception_log_label(exc),
+        )
         return False

@@ -10,6 +10,25 @@ from src.core.assistant import MikuAssistant
 from src.core.dispatch_outcome import DispatchOutcome, ReplyStage
 
 
+def _request_tts(assistant: MikuAssistant, **kwargs):
+    fn = getattr(assistant, "request_tts_for_playback", None)
+    if callable(fn):
+        return fn(**kwargs)
+    allow = kwargs.get("allow_retry", False)
+    return assistant.ensure_tts_for_playback(allow_retry=allow)
+
+
+def _tts_playback_ready(assistant: MikuAssistant) -> bool:
+    fn = getattr(assistant, "_playback_tts_ready", None)
+    if callable(fn):
+        return bool(fn())
+    return assistant.tts_engine is not None
+
+
+def _voice_load_pending(load: object) -> bool:
+    return getattr(load, "pending", False) is True
+
+
 def _print_reply_streaming(
     assistant: MikuAssistant,
     user_input: str,
@@ -83,9 +102,9 @@ def run_text_session(
                 continue
 
             if allow_voice_switch and assistant.check_mode_switch(user_input) == "switch_to_voice":
-                print("\n切换到语音模式...")
+                print("\n切换到语音模式...", flush=True)
                 run_voice_session(assistant, stream_reply=stream_reply)
-                print("\n返回文本模式...")
+                print("\n返回文本模式...", flush=True)
                 continue
 
             if stream_reply:
@@ -116,12 +135,15 @@ def run_interactive_session(
     want_auto_tts = bool(assistant.config.get("assistant.auto_tts", False))
     auto_tts = False
     tts_fail_notified = False
+    tts_pending_notified = False
     if want_auto_tts:
-        load = assistant.ensure_tts_for_playback()
-        if load.ok and assistant.tts_engine is not None:
+        load = _request_tts(assistant, wait=True)
+        if load.ok and _tts_playback_ready(assistant):
             auto_tts = True
             assistant.config.set("assistant.auto_tts", True)
             print("自动语音输出: 开启")
+        elif _voice_load_pending(load):
+            print("自动语音输出: 准备中（文本对话可用，就绪后将自动播报）")
         else:
             assistant.config.set("assistant.auto_tts", False)
             tts_fail_notified = True
@@ -162,15 +184,24 @@ def run_interactive_session(
                 if auto_tts:
                     auto_tts = False
                     assistant.config.set("assistant.auto_tts", False)
+                    want_auto_tts = False
                     print("自动语音输出: 关闭")
                 else:
-                    # 显式 tts：允许清除本会话自动失败封锁后重试
-                    load = assistant.ensure_tts_for_playback(allow_retry=True)
-                    if load.ok and assistant.tts_engine is not None:
+                    want_auto_tts = True
+                    load = _request_tts(assistant, allow_retry=True, wait=True)
+                    if load.ok and _tts_playback_ready(assistant):
                         auto_tts = True
                         assistant.config.set("assistant.auto_tts", True)
                         tts_fail_notified = False
+                        tts_pending_notified = False
                         print("自动语音输出: 开启")
+                    elif _voice_load_pending(load):
+                        auto_tts = False
+                        if not tts_pending_notified:
+                            tts_pending_notified = True
+                            print("自动语音输出: 仍在准备中（文本对话可用）")
+                        else:
+                            print("自动语音输出: 准备中")
                     else:
                         auto_tts = False
                         assistant.config.set("assistant.auto_tts", False)
@@ -183,6 +214,14 @@ def run_interactive_session(
                         else:
                             print("自动语音输出: 关闭（TTS 仍不可用）")
                 continue
+
+            if want_auto_tts and not auto_tts:
+                probe = _request_tts(assistant, wait=False)
+                if probe.ok and _tts_playback_ready(assistant):
+                    auto_tts = True
+                    assistant.config.set("assistant.auto_tts", True)
+                    tts_fail_notified = False
+                    tts_pending_notified = False
 
             if user_input.lower() == "stream":
                 stream_on = not stream_on

@@ -1,0 +1,27 @@
+# 内存泄漏专项一：Ollama后台预热实际回收（已放行）
+
+Root已用tmp/codex_llm_warmup_leak_root_2026_11_04.py在旧源码复现：默认assembly开启后台预热、fake请求仍阻塞时，Core.shutdown却置_shutdown_flow_done=True；Thread.start已实际启动但抛普通异常时，旧代码丢弃_thread，第二次start又创建线程。报告llm_leak_root3_before_20261104a两FAIL一ERROR保留。第三个HTTP未显式close问题为下一独立切片，本轮不处理。
+
+这是新发现的真实生命周期缺口；之前关闭预热的短循环没有覆盖，不能说已被前轮验收排除。与旧64GB机器高占用是否有因果关系尚未证实，不得声称本修复解决了系统全部内存压力。
+
+先读AGENTS、四个仓库skills、存在的.cursor/rules/system-safety.mdc、README、相关src和tests。检查dirty，保留所有已有修改。实施范围：src/llm/ollama_client.py（必要时一个窄warmup helper，优先不新增框架）、src/core/assembly.py、src/core/assistant.py；对应新测试tests/test_ollama_warmup_lifecycle.py与旧tests/test_ollama_performance.py必要fixture迁移。不要改memory aware、已有OwnedThreadTask底层、TFM、模型/音色/配置/权限、Root探针/监督器或报告。
+
+## 契约设计
+
+- 复用src/core/owned_thread.py: OwnedThreadTask。每client最多1个实际warmup owner；新代只有旧owner实际quiet后才允许，不以_warmup_done/Event或daemon冒充结束。begin_fresh_warmup/start_warmup/wait_for_warmup/warmup_snapshot的公共参数/代际语义保持，snapshot.finished需真实quiet且无pending start；成功还需工作成功且无owner.error。显式fresh仍是资源协调器的唯一新代入口；代际不受旧代迟返污染。
+- 用短_warmup_lock发布owner与保留启动槽；Thread.start、owner.join、HTTP都必须锁外，避免同步线程factory/回调/close重入死锁。发布owner到实际start调用之间必须有start_pending责任，不能把尚未start的quiet owner误判可替换。close与启动并发：cancel已发布owner，creator_pending未结束时不得返回完成。
+- 普通start异常与所有非Exception原对象传播；保留已发布owner，不能直接_thread=None/回退代际制造重复worker。仅实际证明quiet后才允许fresh再试。factory在OS start前失败可以安全恢复可重试；实际已start但ack失败必须保留、拒绝替代。不要为了兼容旧private字段测试继续不安全行为；必要迁移旧fixture。
+- 新增close_warmup(timeout=2.0)->bool：永久closing，取消当前owner，有限实际join；严格True才表示quiet且无pending creator。失败保留重试，不强杀任意线程，不卸载模型、不停止Ollama服务。closing后start返回False、fresh返回稳定不成功代际/0，warm_up不发加载POST；在原metadata准入返回后、真正暖机POST前也检查关闭，避免取消迟返启动模型。不可中断HTTP可继续占用一个owner，必须如实False，不能假装已停止。既有显式keep_alive=0卸载仍可用。
+- 可保留_done用于唤醒，不能把它当actualquiet；old _warmup_thread私有兼容仅在不重复状态/不削弱所有权时保留，否则迁移相应测试。不能捕获fatal后静默当success；wait/snapshot不可将fatal工作当成功。
+
+## 默认装配所有权与关闭
+
+AssembledParts新增llm_warmup_owner可选字段默认None，记录包装memory前实际由assembly创建的原LLM。只在对象的类型明确声明可调用close_warmup契约时登记（不要getattr MagicMock自动生成属性就当支持）；注册rollback严格True检查。不要通过memory wrapper私有_inner递归找owner或新增装饰器关闭整包资源。
+
+Core._bind_parts绑定可选owner与已完成标志，shutdown在独立步骤调用close_warmup并严格is True，将其纳入nonmemory completion。普通异常/False不阻止其它回收，但不能整体done，后续可重试。对旧__new__ fixture保守getattr兼容。from_dependencies没有新owner默认None：调用方注入的LLM仍由调用方管理，不改变所有权。默认开启/关闭memory都应覆盖真实类链条，fake Store/音频构造前fake，不能读正式库。
+
+## 测试要求与STOP
+
+新测试覆盖：实际后台阻塞时Core不假关闭/释放后重试完成；unknown start不产生第二个；factory失败、cancel在start前后、并发close/start、事件已set但实际线程未退出、fresh代际隔离、关闭后无加载POST/卸载可用、default memory wrapper共享原owner、DI无擅自close、超时实际保留、fatal原样。
+
+所有wait返回和BaseException都由主线程断言；finally在patch内释放gate/pin→实际join与strict close→恢复patch→删独占TemporaryDirectory。只fake网络/主机/Store/设备，不启动真实模型、主程序或清理，不读写data/memory。禁止测试/gate/probe/discover运行，禁止改Root文件或已有报告；只写src/tests并做局部AST/编译、git diff --check后STOP。返回文件与契约变化，不自报RootAccepted、不提交推送、不git回退。Root先审fixture再决定独立测试。

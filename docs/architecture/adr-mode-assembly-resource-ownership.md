@@ -34,6 +34,6 @@
 
 恢复装配期无条件构造 TTS/STT；去掉 `resource.*` 与串行预热；删除本 ADR。
 
-## 明确未做（Round 3）
+## 明确未做（Round 3B+）
 
-RVC/设备探测改走 SafetyPolicy 能力白名单、远端 HTTP 策略、云 STT/TTS 许可文案、日志隐私强化。
+远端 HTTP 策略、云 STT/TTS 许可文案、日志隐私强化。Round 3A 已完成 RVC 专用能力与临时文件所有权（见 `adr-rvc-capabilities-temp-ownership.md`）。

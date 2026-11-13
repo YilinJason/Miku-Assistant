@@ -1,0 +1,10 @@
+# Input audio stack: Silero ONNX VAD + pywebrtc NS (default guard path); Codex installs after review.
+# Pin CPU ORT stack reproducibly; numpy matches main env 2.3.5 on CPython 3.12.
+numpy==2.3.5
+onnxruntime==1.24.1
+flatbuffers==25.12.19
+protobuf==7.36.2
+sympy==1.14.0
+mpmath==1.3.0
+packaging==25.0
+pywebrtc-audio==0.2.0

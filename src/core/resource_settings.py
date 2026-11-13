@@ -3,13 +3,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 ResourceProfile = Literal["balanced", "low_vram", "aggressive_keepalive"]
 WarmupOrder = Literal["ollama_then_rvc", "rvc_then_ollama"]
 
 _VALID_PROFILES = frozenset({"balanced", "low_vram", "aggressive_keepalive"})
 _VALID_ORDERS = frozenset({"ollama_then_rvc", "rvc_then_ollama"})
+
+# 资源协调等待 Ollama 预热（串行 GPU）硬上限；与用户前台等待分离
+DEFAULT_WARMUP_TIMEOUT_SEC = 120.0
+MAX_WARMUP_TIMEOUT_SEC = 300.0
+# 用户前台请求等待后台预热完成的短上限
+DEFAULT_FOREGROUND_WARMUP_WAIT_SEC = 5.0
+MAX_FOREGROUND_WARMUP_WAIT_SEC = 10.0
 
 
 @dataclass(frozen=True)
@@ -22,7 +29,8 @@ class ResourceSettings:
     rvc_warmup_on_voice_start: bool = True
     serialize_gpu_warmup: bool = True
     warmup_order: WarmupOrder = "ollama_then_rvc"
-    warmup_timeout: float = 120.0
+    warmup_timeout: float = DEFAULT_WARMUP_TIMEOUT_SEC
+    foreground_warmup_wait_sec: float = DEFAULT_FOREGROUND_WARMUP_WAIT_SEC
 
 
 def _require_bool(path: str, value: Any, default: bool) -> bool:
@@ -33,14 +41,25 @@ def _require_bool(path: str, value: Any, default: bool) -> bool:
     return value
 
 
-def _require_finite_positive(path: str, value: Any, default: float) -> float:
+def _require_finite_positive(
+    path: str,
+    value: Any,
+    default: float,
+    *,
+    max_value: Optional[float] = None,
+) -> float:
     if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{path} must be a finite number, got {type(value).__name__}")
-    number = float(value)
+        number = float(default)
+    else:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"{path} must be a finite number, got {type(value).__name__}"
+            )
+        number = float(value)
     if not math.isfinite(number) or number <= 0.0:
         raise ValueError(f"{path} must be a finite number > 0")
+    if max_value is not None and number > float(max_value):
+        raise ValueError(f"{path} must be <= {max_value:g}")
     return number
 
 
@@ -73,8 +92,9 @@ def parse_resource_settings(config: Any) -> ResourceSettings:
     )
     legacy_timeout = _require_finite_positive(
         "ollama.warmup_timeout",
-        get("ollama.warmup_timeout", 120.0),
-        120.0,
+        get("ollama.warmup_timeout", DEFAULT_WARMUP_TIMEOUT_SEC),
+        DEFAULT_WARMUP_TIMEOUT_SEC,
+        max_value=MAX_WARMUP_TIMEOUT_SEC,
     )
 
     ollama_warmup = _require_bool(
@@ -82,7 +102,6 @@ def parse_resource_settings(config: Any) -> ResourceSettings:
         get("resource.ollama.warmup_on_start", None),
         legacy_warmup,
     )
-    # 必须显式 true；profile 不得暗中开启共享模型卸载
     unload = _require_bool(
         "resource.ollama.unload_on_exit",
         get("resource.ollama.unload_on_exit", False),
@@ -115,12 +134,18 @@ def parse_resource_settings(config: Any) -> ResourceSettings:
         "resource.warmup.timeout",
         get("resource.warmup.timeout", None),
         legacy_timeout,
+        max_value=MAX_WARMUP_TIMEOUT_SEC,
+    )
+    foreground_wait = _require_finite_positive(
+        "resource.warmup.foreground_wait_sec",
+        get("resource.warmup.foreground_wait_sec", None),
+        DEFAULT_FOREGROUND_WARMUP_WAIT_SEC,
+        max_value=MAX_FOREGROUND_WARMUP_WAIT_SEC,
     )
 
     if profile == "aggressive_keepalive":
         if get("resource.warmup.serialize_gpu", None) is None:
             serialize = False
-    # low_vram 仅作文档提示档；不自动打开 unload_on_exit
 
     return ResourceSettings(
         profile=profile,  # type: ignore[arg-type]
@@ -130,4 +155,5 @@ def parse_resource_settings(config: Any) -> ResourceSettings:
         serialize_gpu_warmup=serialize,
         warmup_order=order,
         warmup_timeout=timeout,
+        foreground_warmup_wait_sec=foreground_wait,
     )

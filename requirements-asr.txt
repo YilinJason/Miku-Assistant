@@ -1,0 +1,8 @@
+# Paraformer 专用 ASR 环境（.venv-asr）。仅通过 scripts/prepare_paraformer.py --execute 安装。
+# 占用本地磁盘（约 1GB+ 权重 + 虚拟环境），无按分钟 API 计费；下载一次后离线推理。
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+torchaudio==2.6.0+cpu
+funasr==1.4.22
+numpy==1.26.4
+transformers==4.49.0

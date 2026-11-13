@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from src.core.assistant import MikuAssistant
+from src.core.assistant import MikuAssistant, VoiceStackLoadResult
 
 
 @dataclass
@@ -21,6 +21,7 @@ class VoicePreflightReport:
     """
 
     ok: bool = False
+    pending: bool = False
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -32,12 +33,22 @@ class VoicePreflightReport:
             含状态、错误与警告列表的格式化字符串。
         """
         lines = ["语音模式检查:"]
-        lines.append(f"  状态: {'通过' if self.ok else '未通过'}")
+        if self.pending:
+            lines.append("  状态: 准备中")
+        else:
+            lines.append(f"  状态: {'通过' if self.ok else '未通过'}")
         for err in self.errors:
             lines.append(f"  [错误] {err}")
         for warn in self.warnings:
             lines.append(f"  [警告] {warn}")
         return "\n".join(lines)
+
+
+def _request_voice_stack(assistant: MikuAssistant) -> VoiceStackLoadResult:
+    fn = getattr(assistant, "request_voice_stack", None)
+    if callable(fn):
+        return fn(wait=True)
+    return assistant.ensure_voice_stack()
 
 
 def check_voice_preflight(assistant: MikuAssistant) -> VoicePreflightReport:
@@ -52,7 +63,13 @@ def check_voice_preflight(assistant: MikuAssistant) -> VoicePreflightReport:
     """
     report = VoicePreflightReport()
 
-    load = assistant.ensure_voice_stack()
+    load = _request_voice_stack(assistant)
+    pending = getattr(load, "pending", False) is True
+    if pending:
+        report.pending = True
+        report.warnings.extend(load.warnings)
+        report.errors.append("本地语音模型仍在准备中，请稍后再试语音模式")
+        return report
     if not load.ok:
         report.errors.extend(load.errors)
         report.warnings.extend(load.warnings)
@@ -60,7 +77,18 @@ def check_voice_preflight(assistant: MikuAssistant) -> VoicePreflightReport:
     report.warnings.extend(load.warnings)
 
     if not assistant.stt_engine or not assistant.stt_engine.is_ready():
-        report.errors.append("语音识别(STT)未初始化，请安装 SpeechRecognition 和 PyAudio")
+        if assistant.stt_engine is not None:
+            detail_fn = getattr(
+                assistant.stt_engine, "input_audio_readiness_detail", None
+            )
+            if callable(detail_fn):
+                ready, hint = detail_fn()
+                if not ready:
+                    report.errors.append(hint or "声学 VAD 未就绪")
+                    return report
+        report.errors.append(
+            "语音识别(STT)未初始化，请安装 SpeechRecognition、PyAudio 与 webrtcvad-wheels"
+        )
         return report
 
     mic_ok, mic_msg = assistant.stt_engine.check_microphone()

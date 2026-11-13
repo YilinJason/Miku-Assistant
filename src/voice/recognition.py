@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -23,6 +24,31 @@ class RecognitionStatus(str, Enum):
     INTERNAL_ERROR = "internal_error"
 
 
+def _validate_capture_timing_fields(
+    start: Optional[float],
+    end: Optional[float],
+    *,
+    status: RecognitionStatus,
+) -> None:
+    if start is None and end is None:
+        return
+    if start is None or end is None:
+        raise ValueError("capture timing requires both start and end")
+    for name, value in (
+        ("capture_start_mono", start),
+        ("capture_end_mono", end),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a finite non-negative number")
+        number = float(value)
+        if not math.isfinite(number) or number < 0.0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+    if float(end) < float(start):
+        raise ValueError("capture_end_mono must be >= capture_start_mono")
+    if status is not RecognitionStatus.SUCCESS:
+        raise ValueError("non-success recognition must not carry capture timing")
+
+
 @dataclass(frozen=True)
 class RecognitionResult:
     """结构化识别结果；只有 ``SUCCESS`` 可以携带用户文本。"""
@@ -30,6 +56,8 @@ class RecognitionResult:
     status: RecognitionStatus
     text: str = ""
     error_detail: Optional[str] = None
+    capture_start_mono: Optional[float] = None
+    capture_end_mono: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, RecognitionStatus):
@@ -40,6 +68,11 @@ class RecognitionResult:
             raise TypeError("error_detail must be str or None")
         normalized = self.text.strip()
         object.__setattr__(self, "text", normalized)
+        _validate_capture_timing_fields(
+            self.capture_start_mono,
+            self.capture_end_mono,
+            status=self.status,
+        )
         if self.status is RecognitionStatus.SUCCESS:
             if not normalized:
                 raise ValueError("SUCCESS recognition requires non-empty text")
@@ -49,8 +82,19 @@ class RecognitionResult:
             raise ValueError("non-success recognition must not carry text")
 
     @classmethod
-    def success(cls, text: str) -> "RecognitionResult":
-        return cls(status=RecognitionStatus.SUCCESS, text=text)
+    def success(
+        cls,
+        text: str,
+        *,
+        capture_start_mono: Optional[float] = None,
+        capture_end_mono: Optional[float] = None,
+    ) -> "RecognitionResult":
+        return cls(
+            status=RecognitionStatus.SUCCESS,
+            text=text,
+            capture_start_mono=capture_start_mono,
+            capture_end_mono=capture_end_mono,
+        )
 
     @classmethod
     def failure(
@@ -87,6 +131,8 @@ class RecognitionResult:
                 status=value.status,
                 text=value.text,
                 error_detail=value.error_detail,
+                capture_start_mono=value.capture_start_mono,
+                capture_end_mono=value.capture_end_mono,
             )
         except Exception as exc:
             # 只收口普通实现/数据错误；KeyboardInterrupt/SystemExit 仍会向上抛出。

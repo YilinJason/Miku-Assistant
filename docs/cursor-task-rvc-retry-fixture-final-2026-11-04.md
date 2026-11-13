@@ -1,0 +1,22 @@
+# RVC重试：最终测试fixture收口（仅测试）
+
+## Root续审（38定点测试PASS，仍有两处fixture假证据）
+
+Root独立38项PASS（tmp/codex_gate_rvc_retry_root_repo_final_20261104o_2026_11_02.json），生产无新问题。请仅修以下2处现存测试：
+
+- ctor取消quietFalse：当前在退出patch(_worker_client)作用域后才调用stop_rvc_worker，global已恢复None，这个二次stop实际没有触及刚才client，断言清空是空验证。把恢复quiet后的stop放在global/key patch仍持有client的作用域内，断言stop确实命中同client且fence仍在、最后global/key均None；可只把stop方法patch嵌套改True，不能提前退出global patch。
+- foreground：job/fg_thread当前在entered/pending等主断言之后才捕获，前面断言失败时finally仍丢owner。request返回后立即捕获job/thread，finally可从app._fg_active_job取得本次job补救（确认身份，不join别人），release→join→notalive在patch作用域内，主断言失败也确认退出。slow_retry捕获BaseException后回传主线程；模拟成功时置engine._rvc_ready=True使最终job.result是真成功并断言ok/notpending，不能只assert result非None（目标超时异常也会变非None失败结果）。start尚未开始时不用盲join，但unknown start/已进入不得丢owner。保持无需真实模型。
+
+修后仅单模块新label定点gate，停止供Root，不再改生产/扩范围。已有38 PASS不代表这两项fixture的失败路径已可靠。
+
+生产Root23边界已PASS；用户额度恢复。读AGENTS/协作与质量skills、当前review/handoff；巨大dirty保留，禁止git checkout/reset/restore/clean/整文件回退。仅改tests/test_rvc_explicit_retry.py与交接，不动生产/Root探针监督器，不读改删正式data/memory，无模型/设备/下载/清理/提交推送。
+
+源码复审确认需修三个测试缺口：
+
+1. test_late_get_worker_cancel_skips_start_and_warm的finally只join未确认退出；patch作用域也在finally释放/真实join之前退出。把gate释放、join+notalive及线程异常核对放在patch仍有效的有界清理里，主断言失败也执行；不能join未启动thread伪造新异常掩盖原错。目标捕获BaseException由主线程确认，start/warm均应零次。
+2. test_foreground_explicit_retry_short_budget中release.wait(5)未校验，finally只有app.shutdown（其返回不等于join完成）。保留job/thread真实引用，finally先release再有界join并assert notalive，确认job终态/结果不会吞目标错误；main断言失败路径也保证执行。目标等待超时必须失败，不自动返回True，不能if job None便跳过必需证据。无额外watchdog线程或宽松warnings替代pending。
+3. test_cancelled_ctor_fences_before_quiet_disposal参数化quiet=True/False：False时get返回确切client且global仍强持有、fence先于stop，恢复quiet后同owner可再次完整stop并清单例；True时抛既有Unavailable且global/key清空。不能只标题声称覆盖quietFalse。
+
+已有真实构造的engine/App按各自owner有界shutdown（原_register_engine_stop仅停global，不等于engine.shutdown）；只在实际构造完整engine时注册其shutdown，__new__的无资源fake不强行调用缺字段shutdown。不弱化既有断言、不改变生产为测试特判。
+
+先现有Root scoped gate新label单模块（<=120秒、前台、WAV零差），失败定点修fixture；通过compileall指定测试/diffcheck，写交接实际count/JSON后STOP供Root审阅及分组回归。此次不开始新板块。

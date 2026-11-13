@@ -16,10 +16,35 @@ from src.core.assistant import MikuAssistant
 
 
 def _setup_console_encoding() -> None:
-    """在 Windows 上将 stdout/stderr 重包装为 UTF-8，避免中文乱码。"""
-    if sys.platform == "win32":
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+    """在 Windows 上将 stdout/stderr 重包装为 UTF-8，避免中文乱码。
+
+    必须保留 ``line_buffering`` / ``write_through``：裸 ``TextIOWrapper`` 在
+    Windows 控制台上常变成块缓冲，语音模式提示会晚于 logging 出现，看起来像卡死。
+    """
+    if sys.platform != "win32":
+        return
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        buffer = getattr(stream, "buffer", None)
+        if stream is None or buffer is None:
+            continue
+        line_buffering = bool(getattr(stream, "line_buffering", False))
+        if not line_buffering and callable(getattr(stream, "isatty", None)):
+            try:
+                line_buffering = bool(stream.isatty())
+            except Exception:
+                line_buffering = False
+        setattr(
+            sys,
+            name,
+            io.TextIOWrapper(
+                buffer,
+                encoding="utf-8",
+                errors=getattr(stream, "errors", "replace") or "replace",
+                line_buffering=line_buffering,
+                write_through=True,
+            ),
+        )
 
 
 def _ensure_project_path() -> None:
@@ -98,7 +123,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n\n正在退出...")
     except Exception as exc:
-        logging.error("程序错误: %s", exc, exc_info=True)
+        from src.core.log_privacy import exception_log_label
+
+        # 持久日志仅记安全标签；面向用户的 print 可保留正文
+        logging.error(
+            "程序错误 err=%s", exception_log_label(exc), exc_info=True
+        )
         print(f"错误: {exc}")
     finally:
         if assistant:

@@ -62,8 +62,26 @@ _PLACEHOLDER_VALUES = frozenset(
     }
 )
 
+# 可作为「喜欢的X是Y」槽位名的领域标签（不得作为 value）
+_ALLOWED_DOMAIN_SLOTS = frozenset(
+    {
+        "饮品",
+        "饮料",
+        "食物",
+        "口味",
+        "味道",
+        "类型",
+        "种类",
+        "冰激凌",
+        "冰淇淋",
+        "甜筒",
+        "东西",
+    }
+)
+
 _VALUE_LATIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{1,}")
-_VALUE_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]{2,}")
+# 允许单字中文事实值（茶/猫/狗）；占位与标签仍由 is_placeholder_core 拒绝
+_VALUE_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]+")
 
 _LABEL_STOP = frozenset(
     {
@@ -290,6 +308,7 @@ class PredicateClaim:
     polarity: bool  # True=肯定，False=否定
     value: str
     render_key: str = ""
+    slot: str = ""  # 槽位句式「喜欢的X是Y」中的 X；空表示无槽位
 
 
 def _norm_value(value: str) -> str:
@@ -303,9 +322,19 @@ _META_DENIAL_TAIL_RE = re.compile(
 )
 
 # 用户（第一人称）与事实（第三人称）谓词模式：(family, polarity, render_key, pattern)
-# group(1) = value；须能 fullmatch 整句
+# group(1) = value；槽位句式另有 group(2)；须能 fullmatch 整句
 # 少量安全话语前缀纳入完整语法；未知前缀仍失败关闭
 _USER_SAFE_PREFIX = r"(?:其实|嗯+)?"
+
+# 明确「记住」口语前缀白名单（仅句首一次；按长度降序匹配）
+_REMEMBER_PREFIXES: tuple[str, ...] = (
+    "我跟你说一下",
+    "我想告诉你",
+    "你要记住",
+    "请记住",
+    "记住",
+)
+_REMEMBER_PREFIX_GAP_RE = re.compile(r"^[\s:：,，]+")
 
 _USER_PREDICATE_PATTERNS: tuple[tuple[str, bool, str, re.Pattern[str]], ...] = (
     ("like", False, "like_neg", re.compile(_USER_SAFE_PREFIX + r"我不喜欢\s*(.+)")),
@@ -317,7 +346,19 @@ _USER_PREDICATE_PATTERNS: tuple[tuple[str, bool, str, re.Pattern[str]], ...] = (
         "like_most_drink",
         re.compile(_USER_SAFE_PREFIX + r"我最喜欢的饮品是\s*(.+)"),
     ),
+    (
+        "like",
+        True,
+        "like_most_of_is",
+        re.compile(_USER_SAFE_PREFIX + r"我最喜欢的(.+?)是(.+)"),
+    ),
     ("like", True, "like_most", re.compile(_USER_SAFE_PREFIX + r"我最喜欢(.+)")),
+    (
+        "like",
+        True,
+        "like_of_is",
+        re.compile(_USER_SAFE_PREFIX + r"我喜欢的(.+?)是(.+)"),
+    ),
     ("like", True, "like_pos", re.compile(_USER_SAFE_PREFIX + r"我喜欢(.+)")),
     (
         "like",
@@ -354,7 +395,9 @@ _FACT_PREDICATE_PATTERNS: tuple[tuple[str, bool, str, re.Pattern[str]], ...] = (
     ("like", False, "like_hate", re.compile(r"用户讨厌\s*(.+)")),
     ("like", False, "like_cant", re.compile(r"用户受不了\s*(.+)")),
     ("like", True, "like_most_drink", re.compile(r"用户最喜欢的饮品是\s*(.+)")),
+    ("like", True, "like_most_of_is", re.compile(r"用户最喜欢的(.+?)是(.+)")),
     ("like", True, "like_most", re.compile(r"用户最喜欢(.+)")),
+    ("like", True, "like_of_is", re.compile(r"用户喜欢的(.+?)是(.+)")),
     ("like", True, "like_pos", re.compile(r"用户喜欢(.+)")),
     ("live", False, "live_neg", re.compile(r"用户不住在\s*(.+)")),
     ("live", True, "live_pos", re.compile(r"用户住在\s*(.+)")),
@@ -370,6 +413,23 @@ _FACT_PREDICATE_PATTERNS: tuple[tuple[str, bool, str, re.Pattern[str]], ...] = (
     ("code", True, "code", re.compile(r"用户的?代号是\s*(.+)")),
 )
 
+_SLOT_RENDER_KEYS = frozenset({"like_of_is", "like_most_of_is"})
+
+
+def try_strip_remember_prefix(text: str) -> Optional[str]:
+    """
+    若句首匹配白名单「记住」前缀，返回去除**一个**前缀及可选空白/冒号/逗号后的剩余。
+    未匹配返回 ``None``（不得在句中搜索）。
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    for prefix in _REMEMBER_PREFIXES:
+        if text.startswith(prefix):
+            rest = text[len(prefix) :]
+            rest = _REMEMBER_PREFIX_GAP_RE.sub("", rest, count=1)
+            return rest if rest else None
+    return None
+
 
 def _parse_single_unit(
     unit: str, patterns: Sequence[tuple[str, bool, str, re.Pattern[str]]]
@@ -384,6 +444,32 @@ def _parse_single_unit(
         match = pattern.fullmatch(clause)
         if not match:
             continue
+        if render_key in _SLOT_RENDER_KEYS:
+            slot = _norm_value(match.group(1))
+            value = _norm_value(match.group(2))
+            slot_ok = bool(slot) and (
+                slot in _ALLOWED_DOMAIN_SLOTS
+                or (
+                    slot not in _PLACEHOLDER_VALUES
+                    and not is_placeholder_core(slot)
+                )
+            )
+            if (
+                not slot_ok
+                or not value
+                or value in _PLACEHOLDER_VALUES
+                or is_placeholder_core(value)
+            ):
+                return None
+            if _META_DENIAL_TAIL_RE.search(slot) or _META_DENIAL_TAIL_RE.search(value):
+                return None
+            return PredicateClaim(
+                family=family,
+                polarity=polarity,
+                value=value,
+                render_key=render_key,
+                slot=slot,
+            )
         value = _norm_value(match.group(1))
         if not value or value in _PLACEHOLDER_VALUES or is_placeholder_core(value):
             return None
@@ -396,8 +482,14 @@ def _parse_single_unit(
 
 
 def _parse_single_unit_user(unit: str) -> Optional[PredicateClaim]:
-    """用户侧单单元严格解析（供本地候选枚举）。"""
-    return _parse_single_unit(unit, _USER_PREDICATE_PATTERNS)
+    """用户侧单单元严格解析（供本地候选枚举）；可剥一层白名单「记住」前缀。"""
+    claim = _parse_single_unit(unit, _USER_PREDICATE_PATTERNS)
+    if claim is not None:
+        return claim
+    stripped = try_strip_remember_prefix(unit.strip())
+    if stripped is None:
+        return None
+    return _parse_single_unit(stripped, _USER_PREDICATE_PATTERNS)
 
 
 def _parse_predicates_complete(
@@ -460,7 +552,14 @@ def _claim_supports_fact(user_claim: PredicateClaim, fact_claim: PredicateClaim)
         return False
     if is_placeholder_core(user_claim.value):
         return False
-    return _values_compatible(fact_claim.value, user_claim.value)
+    if not _values_compatible(fact_claim.value, user_claim.value):
+        return False
+    # 槽位句式：两侧都有 slot 时须兼容；一侧无 slot 仍可按 value 对齐
+    if user_claim.slot and fact_claim.slot:
+        if is_placeholder_core(user_claim.slot):
+            return False
+        return _values_compatible(fact_claim.slot, user_claim.slot)
+    return True
 
 
 def unit_strictly_supports_fact(unit: str, fact_claim: PredicateClaim) -> bool:
@@ -512,15 +611,16 @@ def _value_tokens(text: str) -> frozenset[str]:
             tokens.add(word)
     for match in _VALUE_CJK_RE.finditer(text):
         run = match.group(0)
-        if run in _LABEL_STOP:
+        if run in _LABEL_STOP or run in _PLACEHOLDER_VALUES:
             continue
-        if len(run) >= 2 and run not in _LABEL_STOP:
+        # 单字中文（茶/猫/狗）与多字 run 均可作为非空证据
+        if len(run) >= 1 and run not in _LABEL_STOP:
             tokens.add(run)
         if len(run) > 4:
             for size in (2, 3, 4):
                 for i in range(0, len(run) - size + 1):
                     piece = run[i : i + size]
-                    if piece not in _LABEL_STOP:
+                    if piece not in _LABEL_STOP and piece not in _PLACEHOLDER_VALUES:
                         tokens.add(piece)
     return frozenset(tokens)
 

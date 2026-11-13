@@ -4,6 +4,24 @@
 > 章节区分：**历史发现**、**路由可测化（第一小步）**、**助手装配分离（第二小步）**。  
 > 依据：`AGENTS.md`、`skills/safe-refactoring`、`skills/architecture-contracts`、`skills/engineering-quality`。
 
+**语音自然度 Round 1（2026-10-02）**：edge 句级 `rate/pitch/volume`（`src/voice/prosody.py`）；所有 edge 出口共用 helper；仓库 YAML RVC `filter_radius=1` / `rms_mix_rate=0.68`（代码默认不变）；`test_rvc_conversion.py` 默认 dry-run、`--execute` 人工 A/B。见 `docs/architecture/adr-edge-sentence-prosody.md`。离线 fake ≠ 真实听感。
+
+**真实语音 soak 返修（2026-09-30）**：记住前缀白名单与槽位句式；词法召回内容相关性门槛；ingestion `processed` 可观察零候选原因。见 `docs/architecture/adr-natural-companion-memory-soak-fix.md`。离线通过 ≠ 真实 soak 已复验。
+
+**自然陪伴 Round 2（2026-09-30）**：显示原文 / 播报投影双通道；`speech_projection` 抑制 URL 与 fenced code，修正颜文字误伤；流式每轮独占 projector；空投影不计入播报；F4–F8（hold quarantine、大小写 scheme/angle title、中文句读断 URL、增量线性扫描、提示句读合并）已返修。见 `docs/architecture/adr-natural-companion-speech-projection.md`。离线投影契约通过 ≠ 真实语音自然度已验收。
+
+**自然陪伴 Round 1（2026-09-30，Codex 最终复验通过）**：`assistant.companion` 本地固定人格模板（`warm_balanced`）；装配期严格解析；`OllamaClient.base_system` 在 `_build_chat_messages` 与动态 system 合成恰好一条 system；流式/非流式/记忆开闭共用；动态 system 规则不被降级，基础提示构造参数有类型/2400 字硬上限。Codex 独立全量 **628 tests / OK（skipped=4）**。见 `docs/architecture/adr-natural-companion-persona-prompt.md`。真实模型自然度尚未验收。
+
+**安全 Round 3 里程碑（2026-09-30）**：A/B/C1/C2 跨模块复验通过；前台请求等待后台预热默认 5 秒、硬上限 10 秒，与最长 300 秒的显式资源协调上限分离；Ollama 未完成时仍跳过 RVC 预热以避免 GPU 争抢；跨模块异常日志使用稳定标签。Codex 独立全量 **604 tests / OK（skipped=4）**；真实服务/设备与 `data/memory` 未测。
+
+**Round 3C2（2026-09-30）**：SQLite 记忆库路径/身份/sidecar 边界；exclusive 预建 + URI `mode=rw`（防 junction 外部空库）；连接 PRAGMA/扩展/ATTACH/只读硬化；事务 COMMIT 失败统一 rollback；删除确认计划 v2；Codex F1–F7 已返修；见 `docs/architecture/adr-sqlite-memory-privacy-boundary.md`。未进入自然陪伴。真实 `data/memory` 未测；标准库 TOCTOU 剩余风险已在 ADR 写明。
+
+**Round 3C1（2026-09-30）**：持久日志隐私与 `logs/` 文件边界；`LogBoundaryError` 仅用于路径/身份边界；普通截断 `OSError` 走 `handleError`；`backup_count=0` 仅对已验证 fd 截断（禁止路径 `open w`）；极小 MB→至少 1 字节；应用自有 handler 原子关闭/更名；打开后路径↔fd 身份比对；Codex 最终复验通过；见 `docs/architecture/adr-logging-privacy-file-boundary.md`。
+
+**Round 3B（2026-09-30）**：模型端点封存与分类（无 DNS）；远端双许可；禁止跟随 redirect；云 STT/TTS 分权；Codex Round 1 F1–F4 与 Round 2 F5（3xx 拒绝前 best-effort close，close 失败不掩盖 redirect）已返修；见 `docs/architecture/adr-network-egress-model-voice-permissions.md`。
+
+**Round 3A（2026-09-30）**：RVC 改走 `rvc_worker` / `rvc_infer` / `rvc_probe` 专用能力；裸 `SafetyPolicy()` 拒绝专用能力；通用 `subprocess` 默认 false；临时文件白名单+所有权；见 `docs/architecture/adr-rvc-capabilities-temp-ownership.md`。
+
 **范围说明**：CLI 按 `--mode` 在装配前选择启动模式（Round 2）：`text`/`interactive` 不构造语音栈，`voice` 可同步构造；离线测试通过 `from_dependencies` 绕过。审计起点尚未解决播报取消或端到端流式；后续 6.9–6.10 已渐进补齐应用层取消、增量显示/分句播报与语音轮流说话契约，底层音频硬打断仍未实现。
 
 ---
@@ -106,13 +124,13 @@ TTSEngine.speak
 
 1. **入口**：支持的启动方式为仓库根目录 **`py main.py` / `python main.py`**（委托 `src.cli.app.main`）。`python -m src.cli.app` **不会**自动进入 CLI（`app.py` 无 `if __name__ == "__main__"`）；本阶段**不**新增模块入口。参数：`--mode text|voice|interactive`、`--config`、`--auto-tts`。  
 2. **意图优先级**：系统控制 → 搜索 → LLM 兜底。  
-3. **系统控制**：仅关机/重启/锁屏；须 `system_power` +（默认）确认对话框；`MIKU_DRY_RUN` / 无权限 / 显式 `dry_run` 时返回拦截文案，不执行。  
+3. **系统控制**：仅关机/重启/锁屏；须 `system_power` +（默认）确认对话框；经 `safe_system_power_run` 固定 argv，不依赖通用 `subprocess`；`MIKU_DRY_RUN` / 无权限 / 显式 `dry_run` 时返回拦截文案，不执行。
 4. **LLM 上下文**：请求 payload =（可选）**首条 `messages[0]` system** + **至多 10 条历史消息**（`ConversationHistory` 请求窗口，计的是 **message 条数**，不是「轮」）**+ 当前用户输入** 一条。顺序固定为 `system → 历史 → 当前 user`。`/api/chat` **不得**再带顶层 `system`（属 `/api/generate`）；非空动态 system（含记忆增强块）必须作为 system message 发送，否则会被服务端静默忽略。一对 user/assistant 通常算 2 条消息；故约等于最多 5 轮历史对话再加当前句。内存存储默认按完整轮上限裁剪（`max_stored_turns`，默认 500；见 `adr-storage-retention-cleanup.md`）。仅 `generate_result` 的 `SUCCESS` 非空回复提交一轮；失败/空回复不写半轮；system 不进入短期历史。`generate()` 仍返回字符串：失败为以 `错误:` 开头的兼容文案（**不**用此前缀判断结构化成败）。公开属性 `OllamaClient.conversation_history` 为可修改副本（改副本不影响内部）。默认客户端历史相互隔离；显式注入同一 `ConversationHistory` 时共享。旧 Handler 仍只调 `generate()`，错误播报问题尚未接入结构化结果。回归测试须检查最终 HTTP `json`（`tests/test_ollama_chat_system_contract.py`），不能只断言包装器 `system=` 参数。
 5. **TTS**：edge-tts 为主，可 RVC；edge 失败可 pyttsx3；朗读前清理 Markdown 星号等；长文可分句流水线。  
-6. **RVC**：独立 venv；Worker 常驻 + 子进程回退；失败时回退播放 edge-tts 音频。  
+6. **RVC**：独立 venv；Worker 常驻 + 一次性推理回退；均经专用能力，不走通用 `subprocess`；失败时回退播放 edge-tts 音频。
 7. **语音模式**：预检不过则不进入；空识别/`WaitTimeout` 继续循环；停止词与「关闭语音模式」可退。  
 8. **退出清理**：`shutdown` 停 Worker、停自动清理并再清一次、关角色接口。  
-9. **安全**：系统副作用经 `SafetyPolicy` / `safe_*`；注册表写死禁用。  
+9. **安全**：系统副作用经 `SafetyPolicy` / `safe_*`；注册表写死禁用；临时文件删除须白名单 + 所有权登记；裸策略拒绝 RVC 专用能力。
 10. **兼容路径**：`src.voice.tts.TTSEngine` 仍可用。
 11. **路由语义**：handler 返回 `None` = 继续交给下一处理器；返回任意字符串（含 `""`）= 已处理并终止链；链上皆 `None` 时 `dispatch` 返回 `None`。
 
@@ -179,7 +197,7 @@ TTSEngine.speak
 | T3c | 全未命中 → `None` | **已测** | |
 | T3d | 可选依赖缺失 | **已测** | controller/searcher/llm 为 `None` |
 | T3e | `build_intent_router` 契约（系统 / **搜索命中** / LLM / 缺失依赖） | **已测** | 搜索断言 query 参数与返回值，且 LLM 未调用 |
-| T9–T10 | 权限拒绝 / 显式 dry-run；关机·重启·锁屏 subTest；隔离 `MIKU_DRY_RUN` | **已测** | mock 确认框与 `safe_subprocess_run`；显式 dry-run 先断言 `SYSTEM_POWER` 允许 |
+| T9–T10 | 权限拒绝 / 显式 dry-run；关机·重启·锁屏 subTest；隔离 `MIKU_DRY_RUN` | **已测** | mock 确认框与 `safe_system_power_run`；显式 dry-run 先断言 `SYSTEM_POWER` 允许 |
 | T4–T5、T11–T13 等 | 错误语义、历史截断、清理、TTS 串行 | **未做** | 超出本轮路由边界 |
 
 **命令（可重复）**：
@@ -433,7 +451,7 @@ C:\Users\uitra\AppData\Local\Programs\Python\Python312\python.exe -X utf8 -m uni
 | 首轮模型冷加载 | 装配成功后后台空 chat 预热；`keep_alive` 默认 30 分钟；正式请求与预热重叠时等待同一次加载 |
 | 延迟定位 | Ollama 终结响应记录加载/提示词/生成/token 速率；与 TTS/RVC/播放日志可逐段对齐 |
 | RVC 重复探测 | Worker 缓存键不再按句调用独立 torch CUDA 探测；设备仍在新 Worker 构造时解析 |
-| 首段音频冷启动 | 默认执行一秒不播放的 RVC 测试推理；librosa 重采样预热可选且默认关闭；失败开放 |
+| 首段音频冷启动 | 默认执行一秒不播放的 RVC 测试推理；librosa 重采样预热可选且默认关闭；预热失败则 `warm_rvc_worker` 返回 False |
 | 插话后下一轮 | 只终止活跃 RVC 工作，空闲 Worker 保留；取消代际阻止尚未发送的旧任务 |
 | 任务堆积 | 语音路径不再创建不可追踪的后台 TTS 线程；单消费者队列维持有界背压 |
 | Worker 卡死 | stdout 真正有界等待、stderr 持续排空、超时后有界终止并关闭管道 |

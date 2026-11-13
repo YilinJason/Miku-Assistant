@@ -1,0 +1,13 @@
+# 内存泄漏专项二：HTTP响应显式回收（已放行）
+
+前置Root预热独立8项与8模块152项已最终通过，官方前置CLI已STOP。现在仅放行本文件范围。
+
+必须等预热生命周期切片Root最终通过后才实施。Root的llm_leak_root3_before_20261104a已发现warm_up返回后fake响应close次数0；源码显示非流生成/聚合流、探测与memory transport等同类路径。requests默认非流消费可能已归还连接，因此这是确定的显式所有权缺口，不等于已证明真实连接持续泄漏，更不能声称解释旧系统约60GB占用。
+
+只允许src/llm/ollama_client.py、src/memory/ollama_extractor.py及必要新tests/test_http_response_lifecycle.py；必要旧fixture只调整fake.close断言，禁止改生成/system/history/记忆事实/端点/权限或已验收warmup状态机。先读AGENTS与四skills、现有best_effort_close_response/enforce_no_redirect及所有调用方，保留dirty。
+
+生产设计：响应所有权属于完成消费的调用方，在成功、HTTP错误、JSON/响应校验错误及fatal异常各出口finally尽力close；复用已有best_effort_close_response，不新建HTTP框架。覆盖warm_up、generate_result（含stream=True聚合）、release_owned_model、check_connection/check_model_available/list_models和RequestsOllamaChatTransport.post_chat。增量generate_stream已有finally close，确认不回归即可；不能在_request_post/_request_get返回前关闭尚需读取的响应。redirect helper先close再抛，避免memory transport重复close已被该helper关闭的对象。requests.post本身抛异常则没有response不伪造cleanup。
+
+资源close普通异常不能改变原业务结果/错误分类、遮盖原fatal；无close方法的旧fake兼容。不得为测试移除资源准入、绕网络策略或进行重复HTTP重试。不启动模型、HTTP、设备或任何真实数据库；正式data/memory禁访问。
+
+测试用计数fake response覆盖成功/HTTP失败/JSON失败/截断聚合流/redirect、网络调用前失败、close普通失败/无close/fatal原对象，以及增量提前generator.close真实恰一次close。主client与memory transport都覆盖，严格核验status/history/touched保持既有契约。所有线程/gate如果有须patch内release→actualjoin→close严格→恢复。Cursor仅源/tests+局部AST/diffcheck后STOP，不运行tests/gate/Rootprobe/改报告，不提交推送。Root再独立验收。

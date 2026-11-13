@@ -96,9 +96,16 @@ class VoiceInputGate:
         output_active: bool = False,
     ) -> InputGateResult:
         normalized = self.normalize(text)
-        if not output_active:
-            return InputGateResult(InputGateDecision.ACCEPT, normalized)
         if normalized in self._controls:
+            return InputGateResult(InputGateDecision.ACCEPT, normalized)
+        if not output_active:
+            # 空闲时仍丢弃单字噪声，避免「呀」这类误识别直接开一轮回复。
+            # 语气词保留，短指令（停/等等）已在上面放行。
+            if (
+                len(normalized) < self.min_interrupt_chars
+                and normalized not in self._fillers
+            ):
+                return InputGateResult(InputGateDecision.TOO_SHORT, normalized)
             return InputGateResult(InputGateDecision.ACCEPT, normalized)
         if normalized in self._fillers or (
             len(normalized) <= 6

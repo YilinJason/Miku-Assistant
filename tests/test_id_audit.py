@@ -1,4 +1,4 @@
-"""id_audit：只读 URI、确认计划与全有或全无删除。"""
+"""id_audit：只读 URI、确认计划 v2 与全有或全无删除。"""
 from __future__ import annotations
 
 import json
@@ -11,13 +11,14 @@ from src.memory.errors import MemoryValidationError
 from src.memory.id_audit import (
     build_confirmation_plan,
     count_memories_readonly,
-    delete_entries_atomic,
     load_audit_entries,
     open_readonly_connection,
     parse_confirmation_plan,
-    verify_entries_against_db,
+    verify_and_delete_plan_entries_atomic,
+    write_confirmation_plan_file,
 )
 from src.memory.models import MemoryCategory, MemorySource, NewMemory
+from src.memory.sqlite_security import connect_memory_db
 from src.memory.sqlite_store import SqliteMemoryStore
 import diagnose_memory_ids as diag_cli
 
@@ -79,23 +80,26 @@ class IdAuditReadonlyAndPlanTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            w = sqlite3.connect(str(db))
-            w.row_factory = sqlite3.Row
+            opened = connect_memory_db(db, readonly=False, check_same_thread=True)
             try:
-                w.execute(
+                opened.conn.execute(
                     "UPDATE memories SET text = ? WHERE id = ?",
                     ("用户喜欢改写后的茶", ids[0]),
                 )
-                w.commit()
-                _db, parsed_entries, _ = parse_confirmation_plan(plan)
+                opened.conn.commit()
+                parsed = parse_confirmation_plan(plan)
                 with self.assertRaises(MemoryValidationError):
-                    verify_entries_against_db(w, parsed_entries)
-                with self.assertRaises(MemoryValidationError):
-                    delete_entries_atomic(w, parsed_entries)
-                after = w.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+                    verify_and_delete_plan_entries_atomic(
+                        opened.conn,
+                        parsed,
+                        db_path=opened.path,
+                        trusted_parent=opened.parent,
+                        trusted_db_identity=opened.db_identity,
+                    )
+                after = opened.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
                 self.assertEqual(after, 2)
             finally:
-                w.close()
+                opened.conn.close()
 
             ro = open_readonly_connection(db)
             try:
@@ -123,11 +127,15 @@ class IdAuditReadonlyAndPlanTests(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertTrue(plan_path.is_file())
+            plan_blob = plan_path.read_text(encoding="utf-8")
+            self.assertNotIn("用户喜欢乌龙茶", plan_blob)
+            self.assertNotIn("用户住在青禾市", plan_blob)
+            self.assertNotIn(str(db.resolve()), plan_blob)
 
             self.assertEqual(diag_cli.main(["--db", str(db), "--execute"]), 2)
 
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            plan["entries"][1]["text"] = "不存在的正文"
+            plan["entries"][1]["row_fingerprint"] = "deadbeef" * 8
             plan["digest"] = "deadbeef"
             bad = Path(tmp) / "bad.json"
             bad.write_text(json.dumps(plan), encoding="utf-8")
@@ -152,6 +160,18 @@ class IdAuditReadonlyAndPlanTests(unittest.TestCase):
                 self.assertEqual(count_memories_readonly(ro2), 0)
             finally:
                 ro2.close()
+
+    def test_write_plan_refuses_overwrite(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db = Path(tmp) / "ow.sqlite3"
+            ids = self._seed(db)
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text("{}", encoding="utf-8")
+            code = diag_cli.main(
+                ["--db", str(db), "--id", ids[0], "--write-plan", str(plan_path)]
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(plan_path.read_text(encoding="utf-8"), "{}")
 
 
 if __name__ == "__main__":
